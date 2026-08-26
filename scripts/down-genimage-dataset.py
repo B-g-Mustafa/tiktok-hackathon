@@ -1,11 +1,25 @@
 #!/usr/bin/env python3
+"""
+Download a size-limited subset of the GenImage dataset from
+Google Drive.
+
+Dependencies (install on the machine that runs this script):
+
+    pip install gdown requests
+"""
 
 import argparse
-import json
-import math
-import subprocess
+import re
 import sys
 from pathlib import Path
+
+try:
+    import gdown
+    import requests
+except ImportError as exc:
+    print(f"ERROR: missing dependency ({exc}).")
+    print("Install with: pip install gdown requests")
+    sys.exit(1)
 
 
 GENIMAGE_URL = (
@@ -27,35 +41,47 @@ CATEGORIES = {
 
 
 def get_drive_listing(folder_url: str):
-    """Get the complete Google Drive folder listing using gdown."""
+    """
+    Recursively list every file in the Drive folder (id + relative
+    path) WITHOUT downloading any file contents.
+    """
 
     print("Reading Google Drive folder structure...")
 
-    command = [
-        "gdown",
-        folder_url,
-        "--folder",
-        "--json",
-        "--quiet",
-    ]
-
-    result = subprocess.run(
-        command,
-        capture_output=True,
-        text=True,
-    )
-
-    if result.returncode != 0:
-        print("ERROR: Could not list Google Drive folder.")
-        print(result.stderr)
-        sys.exit(1)
-
     try:
-        return json.loads(result.stdout)
-    except json.JSONDecodeError:
-        print("ERROR: Could not parse gdown JSON output.")
-        print(result.stdout[:2000])
+        entries = gdown.download_folder(
+            url=folder_url,
+            quiet=True,
+            use_cookies=False,
+            skip_download=True,
+        )
+    except Exception as exc:
+        print("ERROR: Could not list Google Drive folder.")
+        print(exc)
         sys.exit(1)
+
+    if not entries:
+        print("ERROR: Google Drive folder listing came back empty.")
+        sys.exit(1)
+
+    files = []
+
+    for entry in entries:
+        file_id = getattr(entry, "id", None)
+        path = getattr(entry, "path", None) or getattr(
+            entry, "local_path", None
+        )
+
+        if file_id is None and isinstance(entry, dict):
+            file_id = entry.get("id")
+            path = entry.get("path") or entry.get("local_path")
+
+        if file_id is None or path is None:
+            continue
+
+        files.append({"id": file_id, "path": str(path)})
+
+    return files
 
 
 def get_category(path: str):
@@ -82,28 +108,6 @@ def get_category(path: str):
     return None
 
 
-def parse_size_from_listing(file_info):
-    """
-    gdown's JSON listing may contain size information depending
-    on the Drive/gdown version.
-
-    Returns bytes if available, otherwise None.
-    """
-
-    for key in ("size", "size_bytes", "file_size"):
-        value = file_info.get(key)
-
-        if value is None:
-            continue
-
-        try:
-            return int(value)
-        except (ValueError, TypeError):
-            pass
-
-    return None
-
-
 def human_size(size):
     units = ["B", "KB", "MB", "GB", "TB"]
 
@@ -118,31 +122,129 @@ def human_size(size):
     return f"{size:.2f} PB"
 
 
-def download_file(url: str, output_dir: Path):
-    """Download one Google Drive file with resume support."""
+def _extract_confirm_params(html_text: str):
+    """
+    Parse Google Drive's "can't scan this file for viruses"
+    interstitial page for the hidden form fields needed to
+    actually reach the file (confirm token / uuid).
+    """
 
-    output_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
+    params = {}
 
-    command = [
-        "gdown",
-        url,
-        "-O",
-        str(output_dir),
-        "--continue",
-    ]
+    confirm = re.search(r'name="confirm"\s+value="([^"]+)"', html_text)
+    uuid = re.search(r'name="uuid"\s+value="([^"]+)"', html_text)
+
+    if confirm:
+        params["confirm"] = confirm.group(1)
+
+    if uuid:
+        params["uuid"] = uuid.group(1)
+
+    return params
+
+
+def probe_file_size(session: "requests.Session", file_id: str):
+    """
+    Best-effort lookup of a Drive file's size WITHOUT downloading
+    its contents, so the per-category GB budget can be checked
+    *before* starting a multi-GB download.
+
+    Returns the size in bytes, or None if it could not be
+    determined (the caller then falls back to counting the actual
+    size after the file has been downloaded).
+    """
+
+    base_url = "https://drive.google.com/uc"
+    params = {"id": file_id, "export": "download"}
+
+    try:
+        response = session.get(
+            base_url,
+            params=params,
+            stream=True,
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+
+    content_type = response.headers.get("Content-Type", "")
+
+    # Small files: Drive serves the file directly, no interstitial.
+    if "text/html" not in content_type:
+        size = response.headers.get("Content-Length")
+        response.close()
+        return int(size) if size is not None else None
+
+    # Large files: Drive shows a virus-scan warning page first.
+    html_text = response.text
+    response.close()
+
+    confirm_params = _extract_confirm_params(html_text)
+
+    if not confirm_params:
+        # Older Drive flow: confirm token comes back as a cookie.
+        for key, value in session.cookies.items():
+            if key.startswith("download_warning"):
+                confirm_params = {"confirm": value}
+                break
+
+    if not confirm_params:
+        return None
+
+    params.update(confirm_params)
+
+    try:
+        response = session.get(
+            "https://drive.usercontent.google.com/download",
+            params=params,
+            stream=True,
+            timeout=30,
+        )
+    except requests.RequestException:
+        return None
+
+    size = response.headers.get("Content-Length")
+    response.close()
+
+    if size is not None:
+        return int(size)
+
+    # Last resort: the warning text itself often states the size,
+    # e.g. "... (3.5G) is too large for Google to scan ...".
+    match = re.search(r"\(([\d.]+)\s*([KMGT])\)", html_text)
+
+    if not match:
+        return None
+
+    value, unit = match.groups()
+    multiplier = {"K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4}[unit]
+
+    return int(float(value) * multiplier)
+
+
+def download_file(file_id: str, dest_path: Path) -> bool:
+    """Download one Google Drive file (by id) with resume support."""
+
+    dest_path.parent.mkdir(parents=True, exist_ok=True)
 
     print(
         f"\nDownloading:\n"
-        f"  {url}\n"
-        f"  -> {output_dir}"
+        f"  id={file_id}\n"
+        f"  -> {dest_path}"
     )
 
-    result = subprocess.run(command)
+    try:
+        result = gdown.download(
+            id=file_id,
+            output=str(dest_path),
+            quiet=False,
+            resume=True,
+        )
+    except Exception as exc:
+        print(f"[ERROR] {exc}")
+        return False
 
-    return result.returncode == 0
+    return result is not None
 
 
 def download_genimage(
@@ -153,26 +255,15 @@ def download_genimage(
     Download up to max_gb of ZIP data from EACH GenImage
     generator category.
 
-    Example:
-
-        --max-gb 10
-
-    means approximately:
-
-        ADM                  <= 10 GB
-        BigGAN               <= 10 GB
-        glide                <= 10 GB
-        Midjourney           <= 10 GB
-        stable_diffusion_v_1_4 <= 10 GB
-        stable_diffusion_v_1_5 <= 10 GB
-        VQDM                 <= 10 GB
-        wukong               <= 10 GB
-
+    Files are whole (never partially downloaded), so a category's
+    total may land a little under the budget. Example: category
+    has 3 GB zips and max_gb=10 -> 3 files are downloaded (9 GB);
+    the 4th is skipped because it would push the total to 12 GB.
     """
 
     max_bytes = int(max_gb * 1024 ** 3)
 
-    listing = get_drive_listing(GENIMAGE_URL)
+    entries = get_drive_listing(GENIMAGE_URL)
 
     # ---------------------------------------------------------
     # Organize ZIP files by generator
@@ -183,13 +274,9 @@ def download_genimage(
         for category in CATEGORIES
     }
 
-    for item in listing:
+    for entry in entries:
 
-        path = item.get("path", "")
-        url = item.get("url")
-
-        if not url:
-            continue
+        path = entry["path"]
 
         # Only download ZIP files.
         if not path.lower().endswith(".zip"):
@@ -200,18 +287,15 @@ def download_genimage(
         if category is None:
             continue
 
-        size = parse_size_from_listing(item)
-
         categories[category].append(
             {
                 "path": path,
-                "url": url,
-                "size": size,
+                "id": entry["id"],
             }
         )
 
     # ---------------------------------------------------------
-    # Download each category independently
+    # Show the plan
     # ---------------------------------------------------------
 
     print("\n" + "=" * 80)
@@ -237,6 +321,9 @@ def download_genimage(
     # ---------------------------------------------------------
     # Process categories
     # ---------------------------------------------------------
+
+    session = requests.Session()
+    session.headers.update({"User-Agent": "Mozilla/5.0"})
 
     for category in sorted(categories):
 
@@ -265,42 +352,50 @@ def download_genimage(
         for file_info in files:
 
             path = file_info["path"]
-            url = file_info["url"]
-            size = file_info["size"]
+            file_id = file_info["id"]
+
+            size = probe_file_size(session, file_id)
 
             # -------------------------------------------------
-            # If Drive did not expose size, we cannot safely
-            # determine whether this file fits the limit.
+            # Decide whether this file still fits the budget.
             #
-            # Downloading the first file is okay, but for
-            # subsequent files we rely on the actual file size.
+            # If we know its size, check it fits before starting.
+            # If we don't, only start it when nothing has been
+            # downloaded yet for this category (best effort).
             # -------------------------------------------------
 
             if size is not None:
-
-                if (
-                    downloaded_bytes + size
-                    > max_bytes
-                ):
+                if downloaded_bytes + size > max_bytes:
                     print(
                         f"\nReached {max_gb:.2f} GB limit "
                         f"for {category}."
                     )
                     break
+            elif downloaded_bytes >= max_bytes:
+                print(
+                    f"\nReached {max_gb:.2f} GB limit "
+                    f"for {category} (size unknown for "
+                    f"remaining files)."
+                )
+                break
 
             print(
                 f"\n[{downloaded_files + 1}] "
                 f"{Path(path).name}"
             )
 
-            if size:
+            if size is not None:
                 print(
                     f"Size: {human_size(size)}"
                 )
+            else:
+                print("Size: unknown")
+
+            dest_path = category_dir / Path(path).name
 
             success = download_file(
-                url=url,
-                output_dir=category_dir,
+                file_id=file_id,
+                dest_path=dest_path,
             )
 
             if not success:
@@ -318,28 +413,14 @@ def download_genimage(
                 break
 
             # -------------------------------------------------
-            # Count the downloaded file.
-            #
-            # If Drive did not provide size, use the actual
-            # local file size.
+            # Count the downloaded file using its actual local
+            # size (falls back to the probed size if the file
+            # is somehow missing).
             # -------------------------------------------------
 
-            filename = Path(path).name
-
-            local_file = (
-                category_dir / filename
-            )
-
-            if local_file.exists():
-
-                actual_size = (
-                    local_file.stat().st_size
-                )
-
-                downloaded_bytes += actual_size
-
+            if dest_path.exists():
+                downloaded_bytes += dest_path.stat().st_size
             elif size is not None:
-
                 downloaded_bytes += size
 
             downloaded_files += 1
