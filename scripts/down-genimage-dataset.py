@@ -1,4 +1,3 @@
-```python
 from pathlib import Path
 from collections import defaultdict
 from PIL import Image
@@ -356,4 +355,3 @@ if __name__ == "__main__":
         split=args.split,
         dataset_name=args.dataset,
     )
-```
