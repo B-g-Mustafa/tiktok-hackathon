@@ -3,6 +3,12 @@
 Download a size-limited subset of the GenImage dataset from
 Google Drive.
 
+Each GenImage category is one zip archive split across many Drive
+files (foo.z01, foo.z02, ..., foo.zip). All volumes are required to
+extract anything, so for each category this script downloads either
+ALL of its volumes (if the category's total size is <= --max-gb) or
+none at all (category is skipped).
+
 Dependencies (install on the machine that runs this script):
 
     pip install gdown requests
@@ -11,6 +17,7 @@ Dependencies (install on the machine that runs this script):
 import argparse
 import re
 import sys
+import time
 from pathlib import Path
 
 try:
@@ -106,6 +113,38 @@ def get_category(path: str):
                 return category
 
     return None
+
+
+# Each GenImage category is ONE zip archive split across many Drive
+# files: foo.z01, foo.z02, ..., foo.zip. The trailing ".zip" file is
+# the LAST volume (it holds the central directory), not a separate
+# archive. Every volume is required to extract anything, so these
+# must always be downloaded as a complete set.
+ARCHIVE_PART_RE = re.compile(r"\.(zip|z\d{2,3})$", re.IGNORECASE)
+
+
+def is_archive_part(path: str) -> bool:
+    return bool(ARCHIVE_PART_RE.search(path))
+
+
+def part_sort_key(path: str):
+    """
+    Sort split-archive volumes in download order: z01, z02, ...,
+    then the final .zip volume last (it must be written last since
+    it's what most tools check for when reassembling the archive).
+    """
+
+    ext = Path(path).suffix.lower()
+
+    if ext == ".zip":
+        return (1, 0)
+
+    match = re.match(r"\.z(\d+)$", ext)
+
+    if match:
+        return (0, int(match.group(1)))
+
+    return (2, ext)
 
 
 def human_size(size):
@@ -222,29 +261,72 @@ def probe_file_size(session: "requests.Session", file_id: str):
     return int(float(value) * multiplier)
 
 
-def download_file(file_id: str, dest_path: Path) -> bool:
-    """Download one Google Drive file (by id) with resume support."""
+def estimate_category_size(session: "requests.Session", files):
+    """
+    Estimate a category's total archive size WITHOUT probing every
+    part. Split-archive volumes are all the same size except the
+    last one (guaranteed by how `zip -s` splitting works), so we
+    only need to probe the first and last volume.
+
+    Returns bytes, or None if it could not be determined.
+    """
+
+    if len(files) == 1:
+        return probe_file_size(session, files[0]["id"])
+
+    first_size = probe_file_size(session, files[0]["id"])
+    last_size = probe_file_size(session, files[-1]["id"])
+
+    if first_size is None or last_size is None:
+        return None
+
+    return first_size * (len(files) - 1) + last_size
+
+
+def download_file(
+    file_id: str,
+    dest_path: Path,
+    retries: int = 3,
+    backoff_seconds: int = 15,
+) -> bool:
+    """
+    Download one Google Drive file (by id) with resume support.
+
+    Retries on failure (e.g. Drive's transient "too many users have
+    downloaded this file recently" quota errors), since a single
+    missing volume makes the whole split archive unusable.
+    """
 
     dest_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print(
-        f"\nDownloading:\n"
-        f"  id={file_id}\n"
-        f"  -> {dest_path}"
-    )
+    for attempt in range(1, retries + 1):
 
-    try:
-        result = gdown.download(
-            id=file_id,
-            output=str(dest_path),
-            quiet=False,
-            resume=True,
+        print(
+            f"\nDownloading (attempt {attempt}/{retries}):\n"
+            f"  id={file_id}\n"
+            f"  -> {dest_path}"
         )
-    except Exception as exc:
-        print(f"[ERROR] {exc}")
-        return False
 
-    return result is not None
+        try:
+            result = gdown.download(
+                id=file_id,
+                output=str(dest_path),
+                quiet=False,
+                resume=True,
+            )
+        except Exception as exc:
+            print(f"[ERROR] {exc}")
+            result = None
+
+        if result is not None:
+            return True
+
+        if attempt < retries:
+            wait = backoff_seconds * attempt
+            print(f"Retrying in {wait}s...")
+            time.sleep(wait)
+
+    return False
 
 
 def download_genimage(
@@ -252,13 +334,11 @@ def download_genimage(
     max_gb: float,
 ):
     """
-    Download up to max_gb of ZIP data from EACH GenImage
-    generator category.
-
-    Files are whole (never partially downloaded), so a category's
-    total may land a little under the budget. Example: category
-    has 3 GB zips and max_gb=10 -> 3 files are downloaded (9 GB);
-    the 4th is skipped because it would push the total to 12 GB.
+    For EACH GenImage generator category, download the category's
+    complete split-archive (all its .z01/.z02/.../.zip volumes)
+    ONLY IF the category's total size fits within max_gb.
+    Categories that exceed max_gb are skipped entirely, since a
+    partial set of volumes can't be extracted anyway.
     """
 
     max_bytes = int(max_gb * 1024 ** 3)
@@ -266,7 +346,7 @@ def download_genimage(
     entries = get_drive_listing(GENIMAGE_URL)
 
     # ---------------------------------------------------------
-    # Organize ZIP files by generator
+    # Organize archive volumes by generator
     # ---------------------------------------------------------
 
     categories = {
@@ -278,8 +358,7 @@ def download_genimage(
 
         path = entry["path"]
 
-        # Only download ZIP files.
-        if not path.lower().endswith(".zip"):
+        if not is_archive_part(path):
             continue
 
         category = get_category(path)
@@ -294,26 +373,27 @@ def download_genimage(
             }
         )
 
+    for category in categories:
+        categories[category].sort(
+            key=lambda x: part_sort_key(x["path"])
+        )
+
     # ---------------------------------------------------------
     # Show the plan
     # ---------------------------------------------------------
 
     print("\n" + "=" * 80)
     print("GenImage Download Plan")
+    print(f"Per-category limit: {max_gb:.2f} GB")
     print("=" * 80)
 
     for category in sorted(categories):
 
         files = categories[category]
 
-        # Sort by path so multipart ZIPs are downloaded in order.
-        files.sort(
-            key=lambda x: x["path"]
-        )
-
         print(
             f"\n{category}: "
-            f"{len(files)} ZIP files"
+            f"{len(files)} archive volumes"
         )
 
     print("=" * 80)
@@ -329,69 +409,53 @@ def download_genimage(
 
         files = categories[category]
 
-        if not files:
-            print(
-                f"\n[WARNING] No ZIP files found for "
-                f"{category}"
-            )
-            continue
-
-        category_dir = (
-            output_dir / category
-        )
-
         print("\n")
         print("=" * 80)
         print(f"CATEGORY: {category}")
-        print(f"Limit   : {max_gb:.2f} GB")
         print("=" * 80)
+
+        if not files:
+            print(f"[WARNING] No archive volumes found for {category}")
+            continue
+
+        estimated_size = estimate_category_size(session, files)
+
+        if estimated_size is None:
+            print(
+                f"[SKIP] Could not determine {category}'s size "
+                f"(Drive request failed) -- skipping to avoid "
+                f"downloading an unusable partial archive."
+            )
+            continue
+
+        print(
+            f"Estimated size: {human_size(estimated_size)} "
+            f"({len(files)} volumes) -- limit {max_gb:.2f} GB"
+        )
+
+        if estimated_size > max_bytes:
+            print(
+                f"[SKIP] {category} exceeds the {max_gb:.2f} GB "
+                f"per-category limit."
+            )
+            continue
+
+        category_dir = output_dir / category
 
         downloaded_bytes = 0
         downloaded_files = 0
+        incomplete = False
 
         for file_info in files:
 
             path = file_info["path"]
             file_id = file_info["id"]
-
-            size = probe_file_size(session, file_id)
-
-            # -------------------------------------------------
-            # Decide whether this file still fits the budget.
-            #
-            # If we know its size, check it fits before starting.
-            # If we don't, only start it when nothing has been
-            # downloaded yet for this category (best effort).
-            # -------------------------------------------------
-
-            if size is not None:
-                if downloaded_bytes + size > max_bytes:
-                    print(
-                        f"\nReached {max_gb:.2f} GB limit "
-                        f"for {category}."
-                    )
-                    break
-            elif downloaded_bytes >= max_bytes:
-                print(
-                    f"\nReached {max_gb:.2f} GB limit "
-                    f"for {category} (size unknown for "
-                    f"remaining files)."
-                )
-                break
+            dest_path = category_dir / Path(path).name
 
             print(
-                f"\n[{downloaded_files + 1}] "
+                f"\n[{downloaded_files + 1}/{len(files)}] "
                 f"{Path(path).name}"
             )
-
-            if size is not None:
-                print(
-                    f"Size: {human_size(size)}"
-                )
-            else:
-                print("Size: unknown")
-
-            dest_path = category_dir / Path(path).name
 
             success = download_file(
                 file_id=file_id,
@@ -401,49 +465,36 @@ def download_genimage(
             if not success:
 
                 print(
-                    f"[ERROR] Failed to download "
-                    f"{path}"
+                    f"[ERROR] Failed to download {path} "
+                    f"after retries."
                 )
 
                 print(
-                    "You can run the script again; "
-                    "gdown will resume partial files."
+                    f"[INCOMPLETE] {category} is missing volume(s); "
+                    f"rerun the script later to retry -- gdown will "
+                    f"resume any partial file and skip files it "
+                    f"already has."
                 )
 
+                incomplete = True
                 break
-
-            # -------------------------------------------------
-            # Count the downloaded file using its actual local
-            # size (falls back to the probed size if the file
-            # is somehow missing).
-            # -------------------------------------------------
 
             if dest_path.exists():
                 downloaded_bytes += dest_path.stat().st_size
-            elif size is not None:
-                downloaded_bytes += size
 
             downloaded_files += 1
 
             print(
                 f"Category total: "
                 f"{human_size(downloaded_bytes)} "
-                f"/ {max_gb:.2f} GB"
+                f"({downloaded_files}/{len(files)} volumes)"
             )
 
-        print(
-            f"\n[DONE] {category}"
-        )
+        status = "INCOMPLETE" if incomplete else "COMPLETE"
 
-        print(
-            f"Files downloaded: "
-            f"{downloaded_files}"
-        )
-
-        print(
-            f"Total: "
-            f"{human_size(downloaded_bytes)}"
-        )
+        print(f"\n[{status}] {category}")
+        print(f"Volumes downloaded: {downloaded_files}/{len(files)}")
+        print(f"Total: {human_size(downloaded_bytes)}")
 
     # ---------------------------------------------------------
     # Final summary
@@ -463,19 +514,19 @@ def download_genimage(
         if not category_dir.exists():
             continue
 
-        files = list(
-            category_dir.glob("*.zip")
-        )
+        files = [
+            f for f in category_dir.iterdir()
+            if f.is_file()
+        ]
 
         total = sum(
             f.stat().st_size
             for f in files
-            if f.exists()
         )
 
         print(
             f"{category:<30} "
-            f"{len(files):>3} files  "
+            f"{len(files):>3} volumes  "
             f"{human_size(total)}"
         )
 
@@ -496,8 +547,11 @@ if __name__ == "__main__":
         type=float,
         required=True,
         help=(
-            "Maximum GB to download from EACH "
-            "GenImage generator category."
+            "Per-category size limit in GB. Each GenImage "
+            "category is downloaded in full (all its split-zip "
+            "volumes) only if its total size is <= this limit; "
+            "categories over the limit are skipped entirely, "
+            "since a partial set of volumes can't be extracted."
         ),
     )
 
