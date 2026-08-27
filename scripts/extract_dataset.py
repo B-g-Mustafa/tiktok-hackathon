@@ -10,12 +10,16 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.manifest import build_manifest_from_local  # noqa: E402
+from src.logging_utils import configure_logging  # noqa: E402
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> int:
@@ -23,17 +27,23 @@ def main() -> int:
     parser.add_argument("--data-dir", type=Path, required=True,
                         help="Directory containing your downloaded .parquet files.")
     parser.add_argument("--output", type=Path, default=Path("artifacts/manifest.parquet"))
+    parser.add_argument("--log-file", type=Path, default=None,
+                        help="Also write progress to this file (useful under "
+                             "sbatch, where stdout is buffered and doesn't "
+                             "update live).")
     args = parser.parse_args()
 
+    configure_logging(log_file=args.log_file)
+
     if not args.data_dir.is_dir():
-        print(f"ERROR: not a directory: {args.data_dir}")
+        logger.error("not a directory: %s", args.data_dir)
         return 2
 
-    stats = build_manifest_from_local(args.data_dir, args.output, progress=print)
+    stats = build_manifest_from_local(args.data_dir, args.output, progress=logger.info)
 
-    print(f"\n{stats.n_rows:,} rows from {stats.n_shards} shards -> {args.output}")
+    logger.info("%s rows from %s shards -> %s", f"{stats.n_rows:,}", stats.n_shards, args.output)
     if stats.n_failed:
-        print(f"WARNING: {stats.n_failed} shard(s) failed: {stats.failed_shards}")
+        logger.warning("%s shard(s) failed: %s", stats.n_failed, stats.failed_shards)
 
     return 0
 

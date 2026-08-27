@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import logging
 import os
 import sys
 from pathlib import Path
@@ -26,8 +27,11 @@ from src.data.sampling import (  # noqa: E402
     min_side_matched_pool,
     summarize,
 )
+from src.logging_utils import configure_logging  # noqa: E402
 
 MIN_SIDE = 512  # matched scale for both classes; must match the crop size used to fine-tune
+
+logger = logging.getLogger(__name__)
 
 
 def main() -> int:
@@ -43,10 +47,16 @@ def main() -> int:
     parser.add_argument("--workers", type=int, default=8,
                         help="Parallel decode/encode threads. Set to 1 for "
                              "the old fully-sequential behaviour.")
+    parser.add_argument("--log-file", type=Path, default=None,
+                        help="Also write progress to this file (useful under "
+                             "sbatch, where stdout is buffered and doesn't "
+                             "update live).")
     args = parser.parse_args()
 
+    configure_logging(log_file=args.log_file)
+
     if not args.manifest.exists():
-        print(f"ERROR: no manifest at {args.manifest} -- run extract_dataset.py first")
+        logger.error("no manifest at %s -- run extract_dataset.py first", args.manifest)
         return 2
 
     frame = add_size_columns(load_manifest(args.manifest))
@@ -57,14 +67,14 @@ def main() -> int:
     )
 
     if balanced.empty:
-        print("ERROR: nothing left after balancing -- check --manifest and --data-dir")
+        logger.error("nothing left after balancing -- check --manifest and --data-dir")
         return 2
 
     train_df, val_df = generator_disjoint_split(
         balanced, holdout_fraction=args.val_fraction, seed=args.seed
     )
-    print(summarize(train_df, "train"))
-    print(summarize(val_df, "val"))
+    logger.info(summarize(train_df, "train"))
+    logger.info(summarize(val_df, "val"))
 
     train_dir = args.output_dir / "train"
     val_dir = args.output_dir / "val"
@@ -76,13 +86,13 @@ def main() -> int:
         "local", val_df, val_dir, local_dir=args.data_dir, workers=args.workers
     )
 
-    print(f"\ntrain: {train_stats.n_written:,} images -> {train_dir}")
-    print(f"val  : {val_stats.n_written:,} images -> {val_dir}")
+    logger.info("train: %s images -> %s", f"{train_stats.n_written:,}", train_dir)
+    logger.info("val  : %s images -> %s", f"{val_stats.n_written:,}", val_dir)
 
-    print(
-        f"\nNext:\n"
-        f"  python scripts/finetune_lora.py --images-dir {args.output_dir} "
-        f"--train-split train --epochs 3 --lora-rank 8"
+    logger.info(
+        "Next:\n  python scripts/finetune_lora.py --images-dir %s "
+        "--train-split train --epochs 3 --lora-rank 8",
+        args.output_dir,
     )
     return 0
 

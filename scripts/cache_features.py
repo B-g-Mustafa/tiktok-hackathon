@@ -131,6 +131,10 @@ def main() -> int:
                         help="Process at most this many images (smoke test).")
     parser.add_argument("--device", default=None)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--log-file", type=Path, default=None,
+                        help="Also write progress to this file (useful under "
+                             "sbatch/qsub, where stdout is buffered and "
+                             "doesn't update live).")
     parser.add_argument(
         "--local-manifest", type=Path, default=None,
         help="Directory containing a manifest.parquet (from "
@@ -141,7 +145,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    configure_logging(format="%(asctime)s %(levelname)s: %(message)s")
+    configure_logging(format="%(asctime)s %(levelname)s: %(message)s", log_file=args.log_file)
 
     if args.local_manifest is not None:
         from src.data.local_dataset import iter_local_images
