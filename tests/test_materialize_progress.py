@@ -23,7 +23,7 @@ def make_fake_iter(seed: int = 0):
     """A drop-in replacement for iter_selected_images with no network calls."""
     rng = np.random.default_rng(seed)
 
-    def fake_iter(repo_id, selection, failed_shards=None):
+    def fake_iter(repo_id, selection, failed_shards=None, workers=8):
         for _, row in selection.iterrows():
             image = Image.fromarray(
                 rng.integers(0, 256, (32, 32, 3), dtype=np.uint8), mode="RGB"
@@ -153,6 +153,40 @@ def test_checkpoint_writes_leave_no_temp_file_behind(tmp_path):
 
     assert not (out / "manifest.parquet.tmp").exists()
     assert (out / "manifest.parquet").exists()
+
+
+def test_parallel_save_flushes_the_final_partial_batch(tmp_path):
+    """Regression test: saves are batched (batch_size = workers*4) and
+    submitted to a thread pool for concurrency. When the total image count
+    isn't an exact multiple of the batch size, the leftover remainder must
+    still be written -- an earlier version of this dropped it silently."""
+    from src.data.local_dataset import materialize
+
+    # 10 images, workers=8 -> batch_size=32, so ALL 10 are a "leftover"
+    # remainder that never fills a full batch during the main loop.
+    stats = materialize(
+        "fake/repo", make_selection(10), tmp_path / "out", workers=8
+    )
+    assert stats.n_written == 10
+    manifest = pd.read_parquet(stats.output_dir / "manifest.parquet")
+    assert len(manifest) == 10
+    assert manifest["key"].is_unique
+
+
+def test_parallel_and_sequential_saves_produce_identical_results(tmp_path):
+    """workers=1 (sequential) and workers>1 (parallel) must be behaviourally
+    identical -- concurrency is purely a performance change."""
+    from src.data.local_dataset import materialize
+
+    selection = make_selection(37)  # deliberately not a multiple of any batch size
+    seq = materialize("fake/repo", selection, tmp_path / "seq", workers=1)
+    par = materialize("fake/repo", selection, tmp_path / "par", workers=8)
+
+    assert seq.n_written == par.n_written == 37
+
+    seq_manifest = pd.read_parquet(seq.output_dir / "manifest.parquet")
+    par_manifest = pd.read_parquet(par.output_dir / "manifest.parquet")
+    assert set(seq_manifest["key"]) == set(par_manifest["key"])
 
 
 def test_checkpoint_every_does_not_lose_rows(tmp_path):

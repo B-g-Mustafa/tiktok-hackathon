@@ -39,6 +39,9 @@ def main() -> int:
                         help="Cap images per class. Default: use everything available.")
     parser.add_argument("--val-fraction", type=float, default=0.15)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--workers", type=int, default=8,
+                        help="Parallel decode/encode threads. Set to 1 for "
+                             "the old fully-sequential behaviour.")
     args = parser.parse_args()
 
     if not args.manifest.exists():
@@ -65,8 +68,12 @@ def main() -> int:
     train_dir = args.output_dir / "train"
     val_dir = args.output_dir / "val"
 
-    train_stats = materialize("local", train_df, train_dir, local_dir=args.data_dir)
-    val_stats = materialize("local", val_df, val_dir, local_dir=args.data_dir)
+    train_stats = materialize(
+        "local", train_df, train_dir, local_dir=args.data_dir, workers=args.workers
+    )
+    val_stats = materialize(
+        "local", val_df, val_dir, local_dir=args.data_dir, workers=args.workers
+    )
 
     print(f"\ntrain: {train_stats.n_written:,} images -> {train_dir}")
     print(f"val  : {val_stats.n_written:,} images -> {val_dir}")
