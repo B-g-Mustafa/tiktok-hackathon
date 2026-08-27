@@ -70,6 +70,8 @@ def main() -> int:
              "image before scoring, to test the real inference path against "
              "degraded input. Default: 'clean' (no-op).",
     )
+    parser.add_argument("--limit", type=int, default=None,
+                         help="Score at most this many images (smoke test).")
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -99,6 +101,8 @@ def main() -> int:
     paths = sorted(
         p for p in args.image_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS
     )
+    if args.limit:
+        paths = paths[: args.limit]
     if not paths:
         print(f"no images found under {args.image_dir}", file=sys.stderr)
 
