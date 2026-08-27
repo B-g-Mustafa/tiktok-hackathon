@@ -44,10 +44,13 @@ logger = logging.getLogger(__name__)
 REAL_DIRNAMES = frozenset({"real", "nature", "authentic", "reals"})
 FAKE_DIRNAMES = frozenset({"fake", "ai", "generated", "synthetic", "fakes"})
 
-# Directories that are structural (split names) rather than label-bearing --
-# ignored when inferring a "generator" tag from the path.
+# Directories that are structural (split names, or an extraction artifact)
+# rather than label-bearing -- ignored when inferring a "generator" tag from
+# the path. "extracted" specifically matches the output folder name
+# scripts/extract_genimage.py creates, so a generator tag recovers as "ADM"
+# rather than "ADM/extracted".
 SKIP_DIRNAMES = frozenset(
-    {"train", "val", "test", "validation"} | REAL_DIRNAMES | FAKE_DIRNAMES
+    {"train", "val", "test", "validation", "extracted"} | REAL_DIRNAMES | FAKE_DIRNAMES
 )
 
 

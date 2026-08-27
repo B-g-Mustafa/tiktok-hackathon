@@ -84,6 +84,70 @@ phases below.
 
 ---
 
+## 2b. Extracting GenImage's split zips (if you hit "bad zipfile offset")
+
+Each GenImage category is downloaded as ONE archive split across many volumes
+(`imagenet_ai_0508_adm.z01`, `.z02`, ..., `.zip`). The `.zip` is the *last*
+volume — it holds the archive's index, not a self-contained file. Running
+plain `unzip` on just that file makes `unzip` seek to offsets that live in the
+other volumes it never opened; it lands on garbage and reports it as a
+corrupt/zip-bomb-shaped file. That's the exact error you hit — confirmed by
+reproducing it locally against a real multi-volume test archive.
+
+Use [`scripts/extract_genimage.py`](scripts/extract_genimage.py) instead —
+verified end-to-end (byte-identical output, zero extra disk usage) against a
+real split archive before being written:
+
+```bash
+# See the plan first — checks volumes are complete and disk space is
+# sufficient, extracts nothing
+python scripts/extract_genimage.py --root /path/to/gen-image-dataset --dry-run
+
+# Extract everything found under --root (ADM, BIGGAN, Glide, midjourney, ...)
+python scripts/extract_genimage.py --root /path/to/gen-image-dataset
+
+# Just one category
+python scripts/extract_genimage.py --root /path/to/gen-image-dataset --categories ADM
+```
+
+It uses `7z` if available — which reads across the split volumes directly and
+extracts with **no intermediate combined copy**, so disk usage never exceeds
+(original volumes) + (extracted output), which you'd need regardless. Check
+with `which 7z`; if missing and you can't `sudo apt/yum install`, try
+`conda install -c conda-forge p7zip` in your user environment, or
+`module load p7zip` if your cluster provides one (common on HPC login nodes).
+
+Without `7z`, it falls back to `zip -s 0 file.zip --out combined.zip` +
+`unzip`, deleting the combined copy immediately after each category — bounded
+to one category's extra disk at a time, never left behind. (A raw
+`cat z01 z02 ... zip > combined.zip` looks like it should work but is fragile
+in practice — a naive glob easily includes `.zip` twice or in the wrong
+position and silently corrupts the join, which is exactly why this script uses
+`zip -s0` instead of a one-liner.)
+
+The script also catches a second, unrelated cause of the same error: a
+**truncated download** (a missing `.z04` in the middle, say) produces
+"bad zipfile offset" too, for a completely different reason. It checks the
+volume sequence is complete before attempting extraction and tells you which
+part is missing rather than trying and failing confusingly.
+
+Once extracted, each category has an `extracted/train/{ai,nature}` and
+`extracted/val/{ai,nature}` layout — feed that straight into step 3 below.
+
+**Reclaiming disk after a verified extraction** (optional, off by default —
+this permanently deletes your only local copy of the downloaded zip volumes):
+
+```bash
+python scripts/extract_genimage.py --root /path/to/gen-image-dataset \
+  --categories ADM --delete-originals-after-verify
+```
+
+It only deletes a category's volumes after that category's extraction is both
+successful *and* passes a structure check (`train/ai`, `train/nature`,
+`val/ai`, `val/nature` all present and non-empty) — never before.
+
+---
+
 ## 3. Directory arrangement before fine-tuning
 
 Every training/eval script in this repo (`cache_features.py`, `finetune_lora.py`,

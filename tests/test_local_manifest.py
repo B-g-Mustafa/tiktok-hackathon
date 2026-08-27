@@ -199,6 +199,20 @@ def test_no_split_filter_merges_everything(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_generator_tag_ignores_extract_script_output_folder(tmp_path):
+    """scripts/extract_genimage.py extracts into <category>/extracted/, adding
+    a path segment between the generator name and train/val. The generator
+    tag must still resolve to just the generator, not "ADM/extracted"."""
+    root = tmp_path / "genimage"
+    d = root / "ADM" / "extracted" / "train" / "ai"
+    d.mkdir(parents=True)
+    Image.new("RGB", (16, 16)).save(d / "x.png")
+
+    stats = build_local_manifest(root, tmp_path / "out")
+    manifest = pd.read_parquet(stats.manifest_path)
+    assert manifest.iloc[0]["model_name"] == "ADM"
+
+
 def test_generator_tag_recovered_from_genimage_layout(tmp_path):
     root = make_genimage_tree(tmp_path / "genimage", generators=("Midjourney",), n=1)
     stats = build_local_manifest(root, tmp_path / "out")
