@@ -34,16 +34,25 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
+# The main repo (two levels up: dyno/files -> dyno -> tiktok-hackathon), so
+# the robustness transforms can be reused as-is rather than reimplemented --
+# src/transforms/robustness.py is the single source of truth for them.
+MAIN_REPO_ROOT = PROJECT_ROOT.parent.parent
+if str(MAIN_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(MAIN_REPO_ROOT))
+
 import torch  # noqa: E402
 import torchvision.transforms as T  # noqa: E402
 from PIL import Image  # noqa: E402
 
 from models import build_detector  # noqa: E402
 from training.utils import load_checkpoint  # noqa: E402
+from src.transforms.robustness import eval_grid  # noqa: E402
 
 IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+DEGRADATIONS = {t.name: t for t in eval_grid()}
 
 
 def main() -> int:
@@ -55,6 +64,12 @@ def main() -> int:
                          help="Override input resolution. Default: from the checkpoint's config.")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--degrade", default="clean", choices=sorted(DEGRADATIONS),
+        help="Apply one robustness transform (from the eval grid) to every "
+             "image before scoring, to test the real inference path against "
+             "degraded input. Default: 'clean' (no-op).",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -102,13 +117,15 @@ def main() -> int:
         batch.clear()
         batch_paths.clear()
 
+    degrade = DEGRADATIONS[args.degrade]
+
     for path in paths:
         try:
             image = Image.open(path).convert("RGB")
         except Exception as exc:  # noqa: BLE001
             print(f"skipping {path}: {exc}", file=sys.stderr)
             continue
-        batch.append(transform(image))
+        batch.append(transform(degrade(image)))
         batch_paths.append(path)
         if len(batch) >= args.batch_size:
             flush()

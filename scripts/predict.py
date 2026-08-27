@@ -37,8 +37,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.data.io import iter_image_paths, load_image  # noqa: E402
 from src.logging_utils import configure_logging  # noqa: E402
 from src.models.base import ConstantDetector, Detector  # noqa: E402
+from src.transforms.robustness import eval_grid  # noqa: E402
 
 logger = logging.getLogger("predict")
+
+# Same named transforms used to build the offline robustness matrix
+# (src/transforms/robustness.py is the single source of truth) -- lets
+# --degrade simulate one of them on the actual inference path, rather than
+# only ever scoring clean images here and trusting the offline matrix.
+DEGRADATIONS = {t.name: t for t in eval_grid()}
 
 
 def build_detector(spec: str, checkpoint: Path | None) -> Detector:
@@ -68,6 +75,7 @@ def run(
     batch_size: int,
     recursive: bool,
     include_failures: bool,
+    degrade: str = "clean",
 ) -> tuple[list[dict], int]:
     """Score every image. Returns (records, n_failed)."""
     paths = list(iter_image_paths(image_dir, recursive=recursive))
@@ -76,6 +84,8 @@ def run(
 
     records: list[dict] = []
     n_failed = 0
+
+    transform = DEGRADATIONS[degrade]
 
     batch_images = []
     batch_paths = []
@@ -112,7 +122,7 @@ def run(
                 )
             continue
 
-        batch_images.append(result.image)
+        batch_images.append(transform(result.image))
         batch_paths.append(path)
 
         if len(batch_images) >= batch_size:
@@ -151,6 +161,13 @@ def main() -> int:
         action="store_true",
         help="Emit unreadable images with pred=null instead of omitting them.",
     )
+    parser.add_argument(
+        "--degrade", default="clean", choices=sorted(DEGRADATIONS),
+        help="Apply one robustness transform (from the eval grid) to every "
+             "image before scoring, to test the real inference path against "
+             "degraded input instead of only the offline robustness matrix. "
+             "Default: 'clean' (no-op).",
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -165,7 +182,7 @@ def main() -> int:
         return 2
 
     detector = build_detector(args.model, args.checkpoint)
-    logger.info("detector: %s", detector.name)
+    logger.info("detector: %s  degrade: %s", detector.name, args.degrade)
 
     records, n_failed = run(
         image_dir=args.image_dir,
@@ -173,6 +190,7 @@ def main() -> int:
         batch_size=args.batch_size,
         recursive=not args.no_recursive,
         include_failures=args.include_failures,
+        degrade=args.degrade,
     )
 
     args.out.parent.mkdir(parents=True, exist_ok=True)

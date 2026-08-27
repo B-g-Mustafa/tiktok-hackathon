@@ -8,6 +8,7 @@
 
 REPO_DIR="/home/users/ntu/suhelkha/mustafa/tiktok/tiktok-hackathon"
 MODELS_DIR="/home/users/ntu/suhelkha/scratch/mustafa/tiktok-hackathon-models"
+IMAGES_DIR="/home/users/ntu/suhelkha/scratch/mustafa/tiktok-hackathon-data/cf-small/extracted"
 
 module load miniforge3/25.3.1
 conda activate tiktok
@@ -24,13 +25,13 @@ echo "Job started on $(date)"
 # -- baseline architecture test: fit a linear head on cached train features,
 # -- evaluate the full robustness matrix on the val set --
 python scripts/cache_features.py \
-  --local-manifest artifacts/images/train \
+  --local-manifest "$IMAGES_DIR/train" \
   --mode train --n-views 4 \
   --output-dir "$MODELS_DIR/features" \
   --log-file outputs/logs/cache_features_train.log
 
 python scripts/cache_features.py \
-  --local-manifest artifacts/images/val \
+  --local-manifest "$IMAGES_DIR/val" \
   --mode eval \
   --output-dir "$MODELS_DIR/features" \
   --log-file outputs/logs/cache_features_val.log
