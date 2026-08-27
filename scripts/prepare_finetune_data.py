@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -87,4 +88,15 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    exit_code = main()
+
+    # Force the process to actually terminate here, rather than the normal
+    # `raise SystemExit`. A genuinely stuck decode/save thread (a corrupted
+    # record that never returns -- Python cannot forcibly kill a thread) is
+    # non-daemon by default, so a clean interpreter shutdown would wait to
+    # join it even after every real piece of work above is done and printed.
+    # By this point all output has been produced and every file has been
+    # written, so there is nothing left to lose by exiting immediately.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(exit_code)

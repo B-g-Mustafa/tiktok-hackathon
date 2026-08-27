@@ -23,7 +23,7 @@ from __future__ import annotations
 import io
 import logging
 import time
-from concurrent.futures import Executor, ThreadPoolExecutor
+from concurrent.futures import Executor, ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Sequence
@@ -119,6 +119,59 @@ def _decode_one(raw: bytes | None) -> Image.Image | None:
         return None
 
 
+# Total wall-clock budget for one row group's worth of concurrent decodes
+# (not per-image). Legitimate decode of an already-in-memory image is
+# milliseconds, so this is generous margin for real variance, not a tight
+# bound -- it exists to catch a genuinely pathological/corrupt record, not to
+# police normal speed.
+DECODE_BATCH_TIMEOUT_SECONDS = 60.0
+
+
+def _decode_batch(
+    raws: list[bytes | None], executor: Executor
+) -> list[Image.Image | None]:
+    """Decode a batch of images concurrently, immune to one bad item blocking
+    the rest.
+
+    `Executor.map()` looks like the obvious tool for this and is exactly what
+    the first version of this code used -- but `map()` yields results in
+    SUBMISSION order, not completion order. If item 0 of 32 hangs (a
+    corrupted or pathological record; plausible at hundreds of thousands of
+    images pulled from a large real-world download), items 1-31 block behind
+    it even though their threads finished instantly -- confirmed directly:
+    with one artificially slow item in a batch of 8, every other item's
+    result only became observable at the same moment the slow one finished,
+    not when each individually completed. With a TRUE hang (not just slow),
+    that stalls the entire pipeline forever, which is what this replaces.
+
+    `as_completed` yields futures as they actually finish, and the batch-level
+    timeout bounds how long we wait for stragglers -- anything not done by
+    then is treated as failed (logged, not retried) rather than blocking
+    forever. The underlying thread, if genuinely stuck, cannot be forcibly
+    killed (Python threads don't support that) and is abandoned; this trades
+    one leaked thread for the pipeline continuing to make progress.
+    """
+    futures = {executor.submit(_decode_one, raw): i for i, raw in enumerate(raws)}
+    decoded: list[Image.Image | None] = [None] * len(raws)
+
+    try:
+        for future in as_completed(futures, timeout=DECODE_BATCH_TIMEOUT_SECONDS):
+            index = futures[future]
+            try:
+                decoded[index] = future.result()
+            except Exception:  # noqa: BLE001
+                decoded[index] = None
+    except TimeoutError:
+        stuck = sum(1 for f in futures if not f.done())
+        logger.warning(
+            "%d image(s) in this batch did not finish decoding within %.0fs "
+            "-- treating as failed and continuing",
+            stuck, DECODE_BATCH_TIMEOUT_SECONDS,
+        )
+
+    return decoded
+
+
 def _read_rows_from_open_parquet(
     parquet_file: pq.ParquetFile,
     shard: str,
@@ -154,7 +207,7 @@ def _read_rows_from_open_parquet(
 
         raws = [image_bytes[offset] for offset in offsets]
         if executor is not None:
-            decoded = list(executor.map(_decode_one, raws))
+            decoded = _decode_batch(raws, executor)
         else:
             decoded = [_decode_one(raw) for raw in raws]
 
@@ -264,7 +317,7 @@ def iter_selected_images(
                 failed_shards.append(shard)
     finally:
         if executor is not None:
-            executor.shutdown(wait=True)
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def iter_selected_images_local(
@@ -329,4 +382,4 @@ def iter_selected_images_local(
                 continue
     finally:
         if executor is not None:
-            executor.shutdown(wait=True)
+            executor.shutdown(wait=False, cancel_futures=True)

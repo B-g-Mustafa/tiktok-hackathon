@@ -22,7 +22,7 @@ from __future__ import annotations
 import json
 import logging
 import os
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator
@@ -85,6 +85,49 @@ def _save_one(fetched, output_dir: Path):
         return fetched, path, None
     except Exception as exc:  # noqa: BLE001
         return fetched, None, exc
+
+
+# Total wall-clock budget for one batch's worth of concurrent PNG writes (not
+# per-image). Encoding an already-decoded, already-in-memory image is fast;
+# this exists to bound a genuinely stuck write (e.g. a hung network
+# filesystem), not to police normal speed.
+SAVE_BATCH_TIMEOUT_SECONDS = 60.0
+
+
+def _save_batch_concurrent(batch: list, output_dir: Path, executor: ThreadPoolExecutor):
+    """Save a batch of images concurrently, immune to one bad item blocking
+    the rest.
+
+    Uses `as_completed` with a batch-level timeout rather than
+    `Executor.map()`, for the same reason `_decode_batch` does -- `map()`
+    yields strictly in submission order, so one stuck write (a hung network
+    filesystem, say) would block every other already-finished result behind
+    it rather than just itself. See `_decode_batch`'s docstring for the
+    directly-reproduced demonstration of this.
+    """
+    futures = {
+        executor.submit(_save_one, fetched, output_dir): fetched for fetched in batch
+    }
+    results = []
+
+    try:
+        for future in as_completed(futures, timeout=SAVE_BATCH_TIMEOUT_SECONDS):
+            try:
+                results.append(future.result())
+            except Exception as exc:  # noqa: BLE001
+                results.append((futures[future], None, exc))
+    except TimeoutError:
+        # FetchedImage is a plain (non-frozen) dataclass, so it is NOT
+        # hashable -- a set of the objects themselves would raise. Track by
+        # identity instead, which is also the more correct semantic here: we
+        # want "this specific submitted item," not "any item with equal
+        # field values."
+        done_ids = {id(futures[f]) for f in futures if f.done()}
+        for fetched in batch:
+            if id(fetched) not in done_ids:
+                results.append((fetched, None, TimeoutError("save timed out")))
+
+    return results
 
 
 def materialize(
@@ -203,7 +246,7 @@ def materialize(
         nonlocal n_written, n_failed, bytes_written
 
         if save_executor is not None:
-            results = save_executor.map(lambda f: _save_one(f, output_dir), batch)
+            results = _save_batch_concurrent(batch, output_dir, save_executor)
         else:
             results = (_save_one(f, output_dir) for f in batch)
 
@@ -262,7 +305,7 @@ def materialize(
         if progress is not None:
             progress.close()
         if save_executor is not None:
-            save_executor.shutdown(wait=True)
+            save_executor.shutdown(wait=False, cancel_futures=True)
 
     _write_manifest_atomically(rows, manifest_path)
     return MaterializeStats(n_written, n_failed, output_dir, failed_shards)
