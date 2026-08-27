@@ -108,10 +108,33 @@ def main() -> int:
         T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
     ])
 
+    # Loaded early (not just at the metrics step) so --limit can sample both
+    # classes instead of a blind positional slice -- materialize() names
+    # files from "shard#row_index", so alphabetically-sorted filenames tend
+    # to cluster by shard, and a shard can be single-class. A plain
+    # `paths[:limit]` after sorting can then land entirely in one class,
+    # making AUROC undefined for that subset.
+    manifest_path = args.manifest or (args.image_dir / "manifest.parquet")
+    manifest = pd.read_parquet(manifest_path) if manifest_path.exists() else None
+    label_by_path = (
+        {str(Path(row.path).resolve()): int(row.label) for row in manifest.itertuples()}
+        if manifest is not None
+        else {}
+    )
+
     paths = sorted(
         p for p in args.image_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS
     )
-    if args.limit:
+    if args.limit and label_by_path:
+        by_label: dict[int, list[Path]] = {}
+        for p in paths:
+            label = label_by_path.get(str(p.resolve()))
+            if label is not None:
+                by_label.setdefault(label, []).append(p)
+        per_class = max(1, args.limit // max(len(by_label), 1))
+        sampled = [p for group in by_label.values() for p in group[:per_class]]
+        paths = sorted(sampled)[: args.limit]
+    elif args.limit:
         paths = paths[: args.limit]
     if not paths:
         print(f"no images found under {args.image_dir}", file=sys.stderr)
@@ -151,14 +174,9 @@ def main() -> int:
     print(f"scored {len(records)} image(s) -> {args.out}")
 
     # -- metrics, only if a labeled manifest is available --------------------
-    manifest_path = args.manifest or (args.image_dir / "manifest.parquet")
-    if not manifest_path.exists():
+    if manifest is None:
         return 0
 
-    manifest = pd.read_parquet(manifest_path)
-    label_by_path = {
-        str(Path(row.path).resolve()): int(row.label) for row in manifest.itertuples()
-    }
     y_true, y_score = [], []
     for record in records:
         label = label_by_path.get(record["image_path"])
