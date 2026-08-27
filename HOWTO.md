@@ -6,6 +6,24 @@ dataset-shortcut findings, see [README.md](README.md) and
 
 ---
 
+## 0. On a shared cluster: redirect the HF cache off `$HOME`
+
+`huggingface_hub` caches every downloaded shard under `~/.cache/huggingface`
+by default — on an HPC login node that's usually a small-quota `$HOME`, not
+your large `/scratch` allocation. One env var redirects everything (the hub
+file cache *and* the xet chunk cache both derive from it):
+
+```bash
+export HF_HOME=/path/to/your/scratch/huggingface_cache
+mkdir -p "$HF_HOME"
+```
+
+Set this before running any of the download/prep scripts below — `pip`
+doesn't need to know about it, only the scripts that talk to Hugging Face do,
+and they all pick it up automatically from the environment.
+
+---
+
 ## 1. Inference
 
 ```bash

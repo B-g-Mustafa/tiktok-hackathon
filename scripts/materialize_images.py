@@ -27,6 +27,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd  # noqa: E402
 
 from src.data.local_dataset import materialize  # noqa: E402
+from src.logging_utils import configure_logging  # noqa: E402
 
 logger = logging.getLogger("materialize_images")
 
@@ -42,9 +43,7 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=None)
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s"
-    )
+    configure_logging(format="%(asctime)s %(levelname)s: %(message)s")
 
     split_path = args.splits_dir / f"{args.split}.parquet"
     if not split_path.exists():

@@ -61,6 +61,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from src.logging_utils import configure_logging  # noqa: E402
+
 logger = logging.getLogger("extract_genimage")
 
 # Matches "imagenet_ai_0508_adm.z01", "...z12", "...zip" etc.
@@ -326,7 +330,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_logging()
 
     if not args.root.is_dir():
         logger.error("not a directory: %s", args.root)

@@ -45,6 +45,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 
 from src.data.parquet_images import iter_selected_images  # noqa: E402
+from src.logging_utils import configure_logging  # noqa: E402
 from src.models.encoders import ENCODER_CATALOG, FrozenEncoder  # noqa: E402
 from src.transforms.crop import native_crop  # noqa: E402
 from src.transforms.robustness import (  # noqa: E402
@@ -140,9 +141,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s"
-    )
+    configure_logging(format="%(asctime)s %(levelname)s: %(message)s")
 
     if args.local_manifest is not None:
         from src.data.local_dataset import iter_local_images

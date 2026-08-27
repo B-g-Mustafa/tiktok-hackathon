@@ -26,6 +26,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.local_manifest import build_local_manifest  # noqa: E402
+from src.logging_utils import configure_logging  # noqa: E402
 
 logger = logging.getLogger("prepare_local_dataset")
 
@@ -55,9 +56,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s"
-    )
+    configure_logging(format="%(asctime)s %(levelname)s: %(message)s")
 
     output_dir = args.output_dir / args.output_name
     logger.info("scanning %s -> %s", args.root, output_dir)

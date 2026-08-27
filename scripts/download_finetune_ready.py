@@ -42,6 +42,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.local_dataset import materialize  # noqa: E402
 from src.data.manifest import build_manifest  # noqa: E402
+from src.logging_utils import configure_logging  # noqa: E402
 from src.data.sampling import (  # noqa: E402
     SHARD_SIZE_GB,
     add_size_columns,
@@ -99,7 +100,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    configure_logging()
 
     # -- manifest: reuse if present, else scan (metadata only, seconds) -----
     if args.manifest.exists():

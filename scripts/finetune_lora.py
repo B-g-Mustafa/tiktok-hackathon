@@ -42,6 +42,7 @@ from src.models.budget import ParameterBudget  # noqa: E402
 from src.models.encoders import ENCODER_CATALOG  # noqa: E402
 from src.models.lora_encoder import DEFAULT_LORA_TARGETS, LoraEncoder  # noqa: E402
 from src.models.torch_head import TorchLinearHead  # noqa: E402
+from src.logging_utils import configure_logging  # noqa: E402
 from src.transforms.robustness import TrainAugment  # noqa: E402
 
 logger = logging.getLogger("finetune_lora")
@@ -95,9 +96,7 @@ def main() -> int:
     parser.add_argument("--output", type=Path, default=Path("artifacts/checkpoints/lora"))
     args = parser.parse_args()
 
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s"
-    )
+    configure_logging(format="%(asctime)s %(levelname)s: %(message)s")
     torch.manual_seed(args.seed)
 
     train_dir = args.images_dir / args.train_split

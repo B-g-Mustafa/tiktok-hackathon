@@ -35,6 +35,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.data.io import iter_image_paths, load_image  # noqa: E402
+from src.logging_utils import configure_logging  # noqa: E402
 from src.models.base import ConstantDetector, Detector  # noqa: E402
 
 logger = logging.getLogger("predict")
@@ -153,7 +154,7 @@ def main() -> int:
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
-    logging.basicConfig(
+    configure_logging(
         level=logging.ERROR if args.quiet else logging.INFO,
         format="%(levelname)s: %(message)s",
         stream=sys.stderr,
