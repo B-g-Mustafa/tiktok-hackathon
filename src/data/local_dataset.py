@@ -353,7 +353,9 @@ class LocalImageDataset(Dataset):
         return crop, int(row["label"])
 
 
-def iter_local_images(manifest_dir: Path) -> Iterator[FetchedImage]:
+def iter_local_images(
+    manifest_dir: Path, manifest: pd.DataFrame | None = None, workers: int = 8
+) -> Iterator[FetchedImage]:
     """Yield `FetchedImage`s from a local manifest -- the local-disk
     counterpart to `parquet_images.iter_selected_images`.
 
@@ -361,29 +363,62 @@ def iter_local_images(manifest_dir: Path) -> Iterator[FetchedImage]:
     extraction loop needs zero changes to source images from a local GenImage
     directory instead of remote Community Forensics shards: only which
     iterator function it calls differs.
+
+    `manifest`, if given, is used instead of re-reading `manifest.parquet`
+    from `manifest_dir` -- lets a caller pre-filter rows (e.g. skipping
+    already-cached images on resume) without this function needing to know
+    anything about that filtering.
+
+    `workers` decodes that many images concurrently, reusing the exact same
+    `as_completed`-with-timeout batch decode as `parquet_images._decode_batch`
+    -- this used to be a plain sequential `for` loop with no threading at
+    all, unlike every other decode path in this codebase, which made it the
+    dominant bottleneck for `cache_features.py --local-manifest`.
     """
-    from src.data.parquet_images import FetchedImage
+    from src.data.parquet_images import FetchedImage, _decode_batch
 
-    manifest = pd.read_parquet(Path(manifest_dir) / MANIFEST_NAME)
+    if manifest is None:
+        manifest = pd.read_parquet(Path(manifest_dir) / MANIFEST_NAME)
+    rows = manifest.to_dict("records")
 
-    for _, row in manifest.iterrows():
-        path = row["path"]
-        try:
-            with Image.open(path) as handle:
-                image = handle.convert("RGB")
-                image.load()
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("failed to load %s: %s", path, exc)
-            continue
+    executor = ThreadPoolExecutor(max_workers=workers) if workers > 1 else None
+    batch_size = workers * 4 if executor is not None else 1
 
-        yield FetchedImage(
-            image=image,
-            label=int(row["label"]),
-            shard=str(row["key"]),
-            row_in_shard=0,
-            model_name=str(row.get("model_name", "")),
-            min_side=int(row.get("min_side", min(image.size))),
-        )
+    try:
+        for start in range(0, len(rows), batch_size):
+            batch_rows = rows[start : start + batch_size]
+
+            raws: list[bytes | None] = []
+            for row in batch_rows:
+                try:
+                    raws.append(Path(row["path"]).read_bytes())
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("failed to read %s: %s", row["path"], exc)
+                    raws.append(None)
+
+            if executor is not None:
+                decoded = _decode_batch(raws, executor)
+            else:
+                from src.data.parquet_images import _decode_one
+
+                decoded = [_decode_one(raw) for raw in raws]
+
+            for row, image in zip(batch_rows, decoded):
+                if image is None:
+                    logger.warning("failed to decode %s", row["path"])
+                    continue
+
+                yield FetchedImage(
+                    image=image,
+                    label=int(row["label"]),
+                    shard=str(row["key"]),
+                    row_in_shard=0,
+                    model_name=str(row.get("model_name", "")),
+                    min_side=int(row.get("min_side", min(image.size))),
+                )
+    finally:
+        if executor is not None:
+            executor.shutdown(wait=False, cancel_futures=True)
 
 
 def collate_list(batch: list[tuple[Image.Image, int]]) -> tuple[list[Image.Image], list[int]]:
