@@ -1,0 +1,47 @@
+#!/bin/bash
+#PBS -N aigc-baseline-eval
+#PBS -q normal
+#PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
+#PBS -l walltime=04:00:00
+#PBS -j oe
+#PBS -o outputs/logs/job_output.log
+
+REPO_DIR="/home/users/ntu/suhelkha/mustafa/tiktok/tiktok-hackathon"
+MODELS_DIR="/home/users/ntu/suhelkha/scratch/mustafa/tiktok-hackathon-models"
+
+module load miniforge3/25.3.1
+conda activate tiktok
+
+export HF_HOME="/home/users/ntu/suhelkha/scratch/mustafa/hf_cache"
+export TORCH_HOME="/home/users/ntu/suhelkha/scratch/mustafa/hf_cache/torch"
+# export HF_TOKEN="..."   # only needed if pulling a gated model
+
+cd "$REPO_DIR"
+mkdir -p "$MODELS_DIR/features" outputs/logs
+
+echo "Job started on $(date)"
+
+# -- baseline architecture test: fit a linear head on cached train features,
+# -- evaluate the full robustness matrix on the val set --
+python scripts/cache_features.py \
+  --local-manifest artifacts/images/train \
+  --mode train --n-views 4 \
+  --output-dir "$MODELS_DIR/features" \
+  --log-file outputs/logs/cache_features_train.log
+
+python scripts/cache_features.py \
+  --local-manifest artifacts/images/val \
+  --mode eval \
+  --output-dir "$MODELS_DIR/features" \
+  --log-file outputs/logs/cache_features_val.log
+
+TRAIN_CACHE=$(ls -t "$MODELS_DIR"/features/train__*__v4.npz | head -n1)
+EVAL_CACHE=$(ls -t "$MODELS_DIR"/features/val__*__eval.npz | head -n1)
+
+python scripts/train_and_evaluate.py \
+  --train-cache "$TRAIN_CACHE" \
+  --eval-cache "$EVAL_CACHE" \
+  --save-checkpoint "$MODELS_DIR/siglip2-baseline" \
+  --output artifacts/reports
+
+echo "Job completed on $(date)"

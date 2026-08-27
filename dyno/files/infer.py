@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Run a dyno (DINO-backbone) detector checkpoint over a directory of images.
+
+training/utils.py's save_checkpoint embeds the exact model config used for
+that run (backbone, LoRA, dual-stream, mlp dims -- see training/train.py's
+`state = {..., "config": config}`), so this rebuilds the architecture from
+ckpt["config"] via the same build_detector() the training script uses,
+instead of requiring a separate --config YAML that could silently mismatch
+(e.g. loading a LoRA/dual-stream checkpoint into a plain backbone -- which
+`load_checkpoint`'s strict=False would not error on, just under-load).
+
+Note: evaluation/evaluate.py's fuller suite (bias audit, WildFake/GenImage
+OOD) needs a `datasets.sid` module that wasn't included in the files you
+shared, so this script only covers plain directory -> predictions inference,
+same contract as the main repo's scripts/predict.py.
+
+Preprocessing (resize + ImageNet normalization) is standard for
+DINOv2/DINOv3 checkpoints, but the original `datasets/sid.py` that actually
+defined the training-time transform wasn't shared either -- if predictions
+look off, that mismatch is the first thing to check.
+
+Usage:
+    python dyno/files/infer.py --checkpoint /path/to/best_model.pt --image-dir DIR --out preds.json
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+import torch  # noqa: E402
+import torchvision.transforms as T  # noqa: E402
+from PIL import Image  # noqa: E402
+
+from models import build_detector  # noqa: E402
+from training.utils import load_checkpoint  # noqa: E402
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--checkpoint", type=Path, required=True)
+    parser.add_argument("--image-dir", type=Path, required=True)
+    parser.add_argument("--out", type=Path, default=Path("preds_dyno.json"))
+    parser.add_argument("--image-size", type=int, default=None,
+                         help="Override input resolution. Default: from the checkpoint's config.")
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--device", default=None)
+    args = parser.parse_args()
+
+    device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+    ckpt = torch.load(args.checkpoint, map_location="cpu")
+    config = ckpt.get("config")
+    if config is None:
+        raise SystemExit(
+            f"{args.checkpoint} has no embedded 'config' -- pass a checkpoint "
+            f"saved by training/utils.py:save_checkpoint (best_model.pt or "
+            f"checkpoint_latest.pt from a training run)."
+        )
+    print(f"loaded config from checkpoint (epoch {ckpt.get('epoch')}, "
+          f"best_auc {ckpt.get('best_auc')})")
+
+    model = build_detector(config)  # handles LoRA / dual-stream internally, from config
+    load_checkpoint(args.checkpoint, model)
+    model = model.to(device).eval()
+
+    image_size = args.image_size or config.get("data", {}).get("image_size", 384)
+    transform = T.Compose([
+        T.Resize((image_size, image_size)),
+        T.ToTensor(),
+        T.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+    ])
+
+    paths = sorted(
+        p for p in args.image_dir.rglob("*") if p.suffix.lower() in IMAGE_EXTS
+    )
+    if not paths:
+        print(f"no images found under {args.image_dir}", file=sys.stderr)
+
+    records: list[dict] = []
+    batch: list[torch.Tensor] = []
+    batch_paths: list[Path] = []
+
+    def flush() -> None:
+        if not batch:
+            return
+        x = torch.stack(batch).to(device)
+        with torch.no_grad():
+            probs = torch.sigmoid(model(x)).cpu().tolist()
+        for path, prob in zip(batch_paths, probs):
+            records.append({"image_path": str(path.resolve()), "pred": round(float(prob), 6)})
+        batch.clear()
+        batch_paths.clear()
+
+    for path in paths:
+        try:
+            image = Image.open(path).convert("RGB")
+        except Exception as exc:  # noqa: BLE001
+            print(f"skipping {path}: {exc}", file=sys.stderr)
+            continue
+        batch.append(transform(image))
+        batch_paths.append(path)
+        if len(batch) >= args.batch_size:
+            flush()
+    flush()
+
+    records.sort(key=lambda r: r["image_path"])
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out.write_text(json.dumps(records, indent=2))
+    print(f"scored {len(records)} image(s) -> {args.out}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
