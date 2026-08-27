@@ -21,7 +21,8 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Iterator
 
@@ -45,11 +46,31 @@ logger = logging.getLogger(__name__)
 MANIFEST_NAME = "manifest.parquet"
 
 
+def _write_manifest_atomically(rows: list[dict], manifest_path: Path) -> None:
+    """Write the manifest so a hard kill mid-write can never corrupt it.
+
+    A multi-hour, 100GB+ download on a shared HPC cluster is far more likely
+    to end in a SIGKILL (SLURM hitting a walltime limit, the OOM killer) than
+    a clean Ctrl-C -- and a plain `to_parquet(manifest_path)` writes directly
+    to the final file, so a kill mid-write can leave a truncated,
+    unreadable parquet there. The next run's resume attempt would then crash
+    trying to *read* the checkpoint meant to protect it, rather than just
+    losing a little progress. Writing to a temp file in the same directory and
+    using `os.replace` (an atomic rename on POSIX filesystems) means the
+    manifest is always either the old complete version or the new complete
+    version, never a partial one in between.
+    """
+    tmp_path = manifest_path.with_suffix(".parquet.tmp")
+    pd.DataFrame(rows).to_parquet(tmp_path, index=False)
+    os.replace(tmp_path, manifest_path)
+
+
 @dataclass
 class MaterializeStats:
     n_written: int
     n_failed: int
     output_dir: Path
+    failed_shards: list[str] = field(default_factory=list)
 
 
 def materialize(
@@ -59,6 +80,7 @@ def materialize(
     skip_existing: bool = True,
     show_progress: bool = True,
     checkpoint_every: int = 500,
+    local_dir: Path | None = None,
 ) -> MaterializeStats:
     """Download and decode every row in `selection` once, to local PNGs.
 
@@ -68,11 +90,31 @@ def materialize(
     not an edge case.
 
     `show_progress` drives a `tqdm` bar over images written and cumulative
-    bytes on disk. Fetching happens inside the `iter_selected_images`
-    generator, so the bar reflects real network+decode progress as images
-    actually arrive, not an estimate.
+    bytes on disk. Fetching happens inside the underlying generator, so the
+    bar reflects real progress as images actually arrive, not an estimate.
+
+    `local_dir`, if given, reads shards that are already fully downloaded on
+    local disk (e.g. via `scripts/download_full_dataset.py`) instead of
+    fetching remotely -- same row-selection logic, no network at all.
+
+    A shard that could not be read (after retries, for the remote path) is
+    recorded in the returned `MaterializeStats.failed_shards` rather than
+    silently reducing the image count -- so a caller can tell the difference
+    between "the plan asked for fewer images" and "some shards were
+    unreachable and got skipped."
     """
-    from src.data.parquet_images import iter_selected_images
+    if local_dir is not None:
+        from src.data.parquet_images import iter_selected_images_local
+
+        def make_iterator(failed: list[str]):
+            return iter_selected_images_local(
+                local_dir, selection, failed_shards=failed
+            )
+    else:
+        from src.data.parquet_images import iter_selected_images
+
+        def make_iterator(failed: list[str]):
+            return iter_selected_images(repo_id, selection, failed_shards=failed)
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -82,9 +124,24 @@ def materialize(
     rows: list[dict] = []
     bytes_written = 0
     if skip_existing and manifest_path.exists():
-        existing = pd.read_parquet(manifest_path)
-        existing_keys = set(existing["key"])
-        rows = existing.to_dict("records")
+        try:
+            existing = pd.read_parquet(manifest_path)
+        except Exception as exc:  # noqa: BLE001
+            # Only possible from a checkpoint written before the atomic-write
+            # fix, or external corruption -- a fresh run's own checkpoints
+            # can no longer land here (see _write_manifest_atomically). Start
+            # over rather than crash the whole resume on a corrupt leftover;
+            # already-downloaded PNGs on disk just get harmlessly re-fetched.
+            logger.warning(
+                "manifest at %s is unreadable (%s) -- treating as no prior "
+                "progress and starting fresh for this split",
+                manifest_path, exc,
+            )
+            existing = None
+
+        if existing is not None:
+            existing_keys = set(existing["key"])
+            rows = existing.to_dict("records")
         bytes_written = sum(
             Path(r["path"]).stat().st_size
             for r in rows
@@ -98,8 +155,9 @@ def materialize(
     n_written = len(rows)
     n_failed = 0
     n_total = len(selection)
+    failed_shards: list[str] = []
 
-    iterator = iter_selected_images(repo_id, selection)
+    iterator = make_iterator(failed_shards)
     progress = None
     if show_progress:
         from tqdm import tqdm
@@ -147,7 +205,7 @@ def materialize(
             if n_written % checkpoint_every == 0:
                 # Checkpoint the manifest periodically so a crash mid-run does
                 # not lose already-materialized work.
-                pd.DataFrame(rows).to_parquet(manifest_path, index=False)
+                _write_manifest_atomically(rows, manifest_path)
                 if progress is None:
                     logger.info(
                         "materialized %d/%d images (%.2f GB)",
@@ -157,8 +215,8 @@ def materialize(
         if progress is not None:
             progress.close()
 
-    pd.DataFrame(rows).to_parquet(manifest_path, index=False)
-    return MaterializeStats(n_written, n_failed, output_dir)
+    _write_manifest_atomically(rows, manifest_path)
+    return MaterializeStats(n_written, n_failed, output_dir, failed_shards)
 
 
 class LocalImageDataset(Dataset):

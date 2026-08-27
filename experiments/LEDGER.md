@@ -308,3 +308,63 @@ exactly what was asked (inference, GenImage's real/fake structure, directory
 arrangement, phase 1 alone, phase 2 alone), linked from the top of the main
 README. Every command in it was run against real (synthetic) data before being
 written down, which is how the two bugs above were caught.
+
+---
+
+## EXP-007 — Fixing incremental re-download stability (100GB -> 150GB)
+
+**Context:** user asked whether re-running `download_finetune_ready.py` with a
+larger `--budget-gb` would incrementally fetch only the new data, or
+re-download everything.
+
+**Investigated rather than guessed.** Two separate mechanisms determine the
+answer, and they turned out to behave differently:
+
+1. **Shard selection** (`plan_shards` / `_greedy_generator_coverage`): verified
+   a strict-prefix property on the real manifest -- the shard list chosen for
+   a 100GB budget is exactly the first N elements of the list chosen for
+   150GB, for both the generated and authentic halves independently. This
+   holds because the greedy loop's per-step choice depends only on `covered`
+   built up so far, never on the target shard count.
+
+2. **Train/val split** (`generator_disjoint_split`): **did not** have this
+   property, and this was a real bug, not a hypothetical one. It shuffled the
+   CURRENT list of generators (`rng.permutation(generators)`) and took a
+   prefix -- so adding more generators to the pool changes the permutation
+   entirely, potentially moving an already-assigned generator from train to
+   val or back. Measured directly on the real dataset: **222 of 925 shared
+   generators (24%) flipped sides** between a 100GB and a 150GB plan with the
+   same seed. Authentic images had the identical problem via
+   `rng.random(len(authentic)) < holdout_fraction`, which depends on array
+   length/order.
+
+   Consequence for the actual pipeline: `download_finetune_ready.py`
+   materializes train and val into SEPARATE directories, and `materialize()`'s
+   resume logic only checks "does this key exist in THIS directory's
+   manifest." A flipped generator's already-downloaded images would be
+   re-fetched into the new directory without being removed from the old one --
+   silently leaving the same generator's data in both train and val after a
+   budget increase.
+
+**Fix:** replaced the shuffle-and-slice approach with a stable per-item hash
+(`_stable_unit_interval`, SHA-256-based -- not Python's builtin `hash()`,
+which is salted per-process via `PYTHONHASHSEED` and would NOT be
+run-to-run stable). A generator's split membership now depends only on its own
+name and `seed`, never on which other generators happen to be in the pool.
+Authentic images use the same mechanism keyed on their `(shard, row_in_shard)`
+identity rather than array position.
+
+**Verified the fix directly, not just via unit tests:** re-ran the exact
+100GB-vs-150GB comparison that had shown 222 flipped generators --
+**0 flipped generators, 0 flipped authentic images** after the fix. Locked in
+as `test_split_is_stable_as_the_pool_grows` and
+`test_authentic_split_is_stable_as_the_pool_grows` in `test_sampling.py`,
+plus a sanity check that the holdout fraction still lands close to requested
+(hash-based assignment is a per-item Bernoulli draw, not an exact top-N%
+slice, so exact equality isn't expected, just convergence at reasonable N).
+
+**Answer to the user's actual question:** yes, now — rerunning
+`download_finetune_ready.py --budget-gb 150` after an earlier `--budget-gb
+100` run (same `--output-name`, `--seed`, `--min-side`) will download only the
+incremental ~50GB; `materialize()`'s existing resume logic (checkpointed every
+500 images, skip-if-key-exists) handles the rest.

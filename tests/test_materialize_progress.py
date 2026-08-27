@@ -23,7 +23,7 @@ def make_fake_iter(seed: int = 0):
     """A drop-in replacement for iter_selected_images with no network calls."""
     rng = np.random.default_rng(seed)
 
-    def fake_iter(repo_id, selection):
+    def fake_iter(repo_id, selection, failed_shards=None):
         for _, row in selection.iterrows():
             image = Image.fromarray(
                 rng.integers(0, 256, (32, 32, 3), dtype=np.uint8), mode="RGB"
@@ -121,6 +121,38 @@ def test_resume_after_partial_manifest(tmp_path):
     manifest = pd.read_parquet(out / "manifest.parquet")
     assert len(manifest) == 10
     assert manifest["key"].is_unique
+
+
+def test_resume_survives_a_corrupted_manifest(tmp_path):
+    """Simulates the actual failure mode on a shared HPC cluster: a SLURM
+    walltime SIGKILL (or OOM kill) partway through writing the checkpoint,
+    leaving manifest.parquet truncated. Resume must degrade gracefully --
+    treat it as no prior progress and continue -- not crash trying to read it.
+    """
+    from src.data.local_dataset import materialize
+
+    out = tmp_path / "out"
+    out.mkdir()
+    (out / "manifest.parquet").write_bytes(b"not a real parquet file, truncated mid-write")
+
+    stats = materialize("fake/repo", make_selection(10), out)
+    assert stats.n_written == 10
+
+    # The manifest must end up valid and complete, overwriting the corruption.
+    manifest = pd.read_parquet(out / "manifest.parquet")
+    assert len(manifest) == 10
+
+
+def test_checkpoint_writes_leave_no_temp_file_behind(tmp_path):
+    """The atomic-write helper stages to a .tmp file then renames -- confirm
+    nothing is left over after a normal, uninterrupted run."""
+    from src.data.local_dataset import materialize
+
+    out = tmp_path / "out"
+    materialize("fake/repo", make_selection(12), out, checkpoint_every=3)
+
+    assert not (out / "manifest.parquet.tmp").exists()
+    assert (out / "manifest.parquet").exists()
 
 
 def test_checkpoint_every_does_not_lose_rows(tmp_path):

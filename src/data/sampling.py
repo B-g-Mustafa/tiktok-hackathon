@@ -33,6 +33,7 @@ verify that a model trained on the former has not simply learned scale.
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Sequence
@@ -601,6 +602,21 @@ class SplitSummary:
         )
 
 
+def _stable_unit_interval(key: str) -> float:
+    """A deterministic pseudo-random value in [0, 1) for `key`.
+
+    Uses SHA-256 rather than Python's builtin `hash()`, which is salted with a
+    random seed per process (`PYTHONHASHSEED`) specifically to resist
+    hash-flooding attacks -- meaning the same string hashes differently across
+    runs unless that salt is fixed. A real hash gives the same value for the
+    same key on every run, every process, every machine, which is exactly what
+    lets a train/val split stay stable as the underlying pool grows (see
+    `generator_disjoint_split`).
+    """
+    digest = hashlib.sha256(key.encode()).hexdigest()
+    return int(digest[:16], 16) / 0xFFFFFFFFFFFFFFFF
+
+
 def generator_disjoint_split(
     frame: pd.DataFrame,
     holdout_fraction: float = 0.2,
@@ -614,13 +630,25 @@ def generator_disjoint_split(
     the model memorize per-generator fingerprints and report a score that will
     not survive contact with an unseen generator.
 
-    Authentic images are split randomly, since they have no generator to hold
-    out.
+    Authentic images are split by a stable per-row hash, since they have no
+    generator to hold out.
+
+    Membership is decided by a per-item hash rather than shuffling the current
+    pool and taking a prefix. That distinction matters in exactly one
+    situation, but it is the situation this pipeline is actually used in:
+    re-running with a LARGER --budget-gb (more shards -> more generators, more
+    authentic rows) must not change which split an already-downloaded image
+    belongs to. Shuffling `generators` and slicing the top N% depends on the
+    full list's size and order, so adding shards can flip a generator that was
+    in train into val and vice versa (measured: ~24% of shared generators
+    flipped between a 100GB and a 150GB plan on the real dataset). Hashing each
+    generator's identity independently of who else is in the pool this run
+    fixes that: a generator's split assignment depends only on its own name and
+    `seed`, never on how many other generators happen to be selected alongside
+    it.
     """
     if not 0.0 < holdout_fraction < 1.0:
         raise ValueError("holdout_fraction must be strictly between 0 and 1")
-
-    rng = np.random.default_rng(seed)
 
     generated = frame.loc[frame["label"] == LABEL_GENERATED]
     authentic = frame.loc[frame["label"] == LABEL_AUTHENTIC]
@@ -632,13 +660,30 @@ def generator_disjoint_split(
             f"found {len(generators)}"
         )
 
-    shuffled = rng.permutation(generators)
-    n_holdout = max(1, int(round(len(shuffled) * holdout_fraction)))
-    holdout_generators = set(shuffled[:n_holdout])
-
+    holdout_generators = {
+        g
+        for g in generators
+        if _stable_unit_interval(f"{seed}:generator:{g}") < holdout_fraction
+    }
     in_holdout = generated[generator_column].isin(holdout_generators)
 
-    authentic_mask = rng.random(len(authentic)) < holdout_fraction
+    # Authentic images have no generator identity to hash, so use their own
+    # stable row identifier (shard + position within it) instead. Falls back
+    # to the dataframe index if those columns aren't present -- e.g. in tests
+    # that construct a frame directly rather than via the manifest scan;
+    # per-run stability isn't a concern there, only correctness of one call.
+    if {"shard", "row_in_shard"}.issubset(authentic.columns):
+        row_keys = (
+            authentic["shard"].astype(str)
+            + "#"
+            + authentic["row_in_shard"].astype(str)
+        )
+    else:
+        row_keys = authentic.index.to_series().astype(str)
+
+    authentic_mask = row_keys.apply(
+        lambda k: _stable_unit_interval(f"{seed}:row:{k}") < holdout_fraction
+    ).to_numpy()
 
     train = pd.concat(
         [generated.loc[~in_holdout], authentic.loc[~authentic_mask]],

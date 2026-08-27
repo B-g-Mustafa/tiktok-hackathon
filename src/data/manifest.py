@@ -35,7 +35,9 @@ __all__ = [
     "METADATA_COLUMNS",
     "ShardScanError",
     "scan_shard",
+    "scan_shard_local",
     "build_manifest",
+    "build_manifest_from_local",
     "list_parquet_files",
 ]
 
@@ -78,6 +80,30 @@ def _available_columns(schema: pa.Schema, requested: Sequence[str]) -> list[str]
     return [c for c in requested if c in present]
 
 
+def _metadata_table_from_open_parquet(
+    parquet_file: pq.ParquetFile, shard_name: str, columns: Sequence[str]
+) -> pa.Table:
+    """Shared logic for both the remote and local scan paths: read the
+    requested metadata columns and stamp on `shard`/`row_in_shard` so a later
+    pass can fetch exactly these rows without re-scanning."""
+    usable = _available_columns(parquet_file.schema_arrow, columns)
+    if not usable:
+        raise ShardScanError(
+            f"{shard_name}: none of the requested columns exist "
+            f"(schema: {parquet_file.schema_arrow.names})"
+        )
+    table = parquet_file.read(columns=usable)
+
+    n_rows = table.num_rows
+    table = table.append_column(
+        "shard", pa.array([shard_name] * n_rows, type=pa.string())
+    )
+    table = table.append_column(
+        "row_in_shard", pa.array(range(n_rows), type=pa.int64())
+    )
+    return table
+
+
 def scan_shard(
     repo_id: str,
     path: str,
@@ -86,11 +112,7 @@ def scan_shard(
     retries: int = 3,
     backoff: float = 2.0,
 ) -> pa.Table:
-    """Read only `columns` from one parquet shard.
-
-    Adds a `shard` column and a `row_in_shard` index so a later pass can fetch
-    exactly the selected rows without re-scanning.
-    """
+    """Read only `columns` from one REMOTE parquet shard, with retries."""
     from huggingface_hub import HfFileSystem
 
     last_error: Exception | None = None
@@ -102,22 +124,7 @@ def scan_shard(
 
             with fs.open(full_path, "rb") as handle:
                 parquet_file = pq.ParquetFile(handle)
-                usable = _available_columns(parquet_file.schema_arrow, columns)
-                if not usable:
-                    raise ShardScanError(
-                        f"{path}: none of the requested columns exist "
-                        f"(schema: {parquet_file.schema_arrow.names})"
-                    )
-                table = parquet_file.read(columns=usable)
-
-            n_rows = table.num_rows
-            table = table.append_column(
-                "shard", pa.array([path] * n_rows, type=pa.string())
-            )
-            table = table.append_column(
-                "row_in_shard", pa.array(range(n_rows), type=pa.int64())
-            )
-            return table
+                return _metadata_table_from_open_parquet(parquet_file, path, columns)
 
         except Exception as exc:  # noqa: BLE001 - retry any transport failure
             last_error = exc
@@ -125,6 +132,21 @@ def scan_shard(
                 time.sleep(backoff * attempt)
 
     raise ShardScanError(f"{path}: failed after {retries} attempts: {last_error}")
+
+
+def scan_shard_local(
+    local_path: Path,
+    shard_name: str,
+    columns: Sequence[str] = METADATA_COLUMNS,
+) -> pa.Table:
+    """Read only `columns` from one shard that is already on local disk.
+
+    No retries -- a local read failing is a different, rarer class of problem
+    (a genuinely missing/corrupt file) than a network hiccup, and retrying it
+    would just fail the same way three times in a row.
+    """
+    parquet_file = pq.ParquetFile(local_path)
+    return _metadata_table_from_open_parquet(parquet_file, shard_name, columns)
 
 
 @dataclass
@@ -187,6 +209,72 @@ def build_manifest(
 
     # Shards may disagree on column order (or be missing a column); unify_schemas
     # plus promote_options handles both without silently dropping data.
+    combined = pa.concat_tables(tables, promote_options="default")
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    pq.write_table(combined, output_path)
+
+    return ManifestStats(
+        n_rows=combined.num_rows,
+        n_shards=len(tables),
+        n_failed=len(failed),
+        failed_shards=failed,
+    )
+
+
+def build_manifest_from_local(
+    local_dir: Path,
+    output_path: Path,
+    columns: Sequence[str] = METADATA_COLUMNS,
+    workers: int = 8,
+    progress: Callable[[str], None] | None = None,
+) -> ManifestStats:
+    """Scan every already-downloaded local shard's metadata -- no network.
+
+    `local_dir` is whatever `scripts/download_full_dataset.py` (a thin wrapper
+    over `huggingface_hub.snapshot_download`) produced. `snapshot_download`
+    mirrors the repo's own directory layout, so a shard at `local_dir/data/
+    HFCF_small_0.parquet` gets the shard name "data/HFCF_small_0.parquet" --
+    identical to what `scan_shard`'s remote path would have produced for the
+    same file. That match matters: it is what lets a manifest built locally
+    interoperate with every downstream function (`plan_shards`,
+    `iter_selected_images_local`'s shard resolution, ...) without caring which
+    scan produced it.
+    """
+    log = progress or (lambda _msg: None)
+
+    local_dir = Path(local_dir)
+    shard_paths = sorted(local_dir.rglob("*.parquet"))
+    if not shard_paths:
+        raise ShardScanError(f"no .parquet files found under {local_dir}")
+
+    log(f"scanning {len(shard_paths)} local shards with {workers} workers")
+
+    tables: list[pa.Table] = []
+    failed: list[str] = []
+    completed = 0
+
+    def _scan(local_path: Path) -> pa.Table:
+        shard_name = str(local_path.relative_to(local_dir))
+        return scan_shard_local(local_path, shard_name, columns)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = {pool.submit(_scan, path): path for path in shard_paths}
+        for future in as_completed(futures):
+            path = futures[future]
+            completed += 1
+            try:
+                tables.append(future.result())
+            except Exception as exc:  # noqa: BLE001
+                failed.append(str(path.relative_to(local_dir)))
+                log(f"  [{completed}/{len(shard_paths)}] FAILED {path.name}: {exc}")
+            else:
+                if completed % 20 == 0 or completed == len(shard_paths):
+                    log(f"  [{completed}/{len(shard_paths)}] scanned")
+
+    if not tables:
+        raise ShardScanError(f"{local_dir}: every local shard failed to scan")
+
     combined = pa.concat_tables(tables, promote_options="default")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)

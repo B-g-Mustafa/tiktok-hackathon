@@ -282,6 +282,111 @@ def test_split_rejects_bad_fraction():
             generator_disjoint_split(make_frame(), holdout_fraction=bad)
 
 
+def _frame_with_generators(n_generators: int, n_authentic: int = 40, seed: int = 0) -> pd.DataFrame:
+    """A frame with an arbitrary, adjustable number of generators/authentic
+    rows, and shard/row_in_shard columns so the stable-hash path (not the
+    index fallback) is exercised -- the same code path production data uses."""
+    rng = np.random.default_rng(seed)
+    rows = []
+    for i in range(n_authentic):
+        rows.append(
+            {
+                "image_name": f"auth_{i}",
+                "label": LABEL_AUTHENTIC,
+                "model_name": "FFHQ",
+                "shard": f"authshard{i % 5}",
+                "row_in_shard": i,
+            }
+        )
+    for g in range(n_generators):
+        for i in range(10):
+            rows.append(
+                {
+                    "image_name": f"gen{g}_{i}",
+                    "label": LABEL_GENERATED,
+                    "model_name": f"generator/{g}",
+                    "shard": f"genshard{g}",
+                    "row_in_shard": i,
+                }
+            )
+    return pd.DataFrame(rows)
+
+
+def test_split_is_stable_as_the_pool_grows():
+    """The regression test for the actual bug: re-running with a LARGER pool
+    (more shards downloaded, e.g. a bigger --budget-gb) must not move a
+    generator that's already been assigned to train into val, or vice versa --
+    otherwise an already-downloaded image would need to be re-fetched into a
+    different split directory, and the old copy would linger in the wrong one.
+
+    Measured on the real dataset before this fix: growing from a 100GB to a
+    150GB shard plan flipped ~24% of shared generators between train and val.
+    """
+    small = _frame_with_generators(n_generators=20)
+    large = _frame_with_generators(n_generators=60)  # a strict superset by construction
+
+    train_small, val_small = generator_disjoint_split(small, holdout_fraction=0.2, seed=0)
+    train_large, val_large = generator_disjoint_split(large, holdout_fraction=0.2, seed=0)
+
+    def generator_names(frame):
+        return set(frame.loc[frame["label"] == LABEL_GENERATED, "model_name"])
+
+    gens_train_small = generator_names(train_small)
+    gens_val_small = generator_names(val_small)
+    gens_train_large = generator_names(train_large)
+    gens_val_large = generator_names(val_large)
+
+    shared = (gens_train_small | gens_val_small) & (gens_train_large | gens_val_large)
+    assert len(shared) == 20  # every generator from the small run reappears
+
+    flipped = (shared & gens_train_small & gens_val_large) | (
+        shared & gens_val_small & gens_train_large
+    )
+    assert flipped == set(), f"generators changed split membership as pool grew: {flipped}"
+
+
+def test_authentic_split_is_stable_as_the_pool_grows():
+    """Same property, for authentic images: a given (shard, row_in_shard)
+    must land in the same split regardless of how many other authentic rows
+    are in the pool."""
+    small = _frame_with_generators(n_generators=5, n_authentic=30)
+    large = _frame_with_generators(n_generators=5, n_authentic=90)
+
+    train_small, val_small = generator_disjoint_split(small, holdout_fraction=0.2, seed=0)
+    train_large, val_large = generator_disjoint_split(large, holdout_fraction=0.2, seed=0)
+
+    def keys_of(frame, label):
+        subset = frame.loc[frame["label"] == label]
+        return set(subset["shard"] + "#" + subset["row_in_shard"].astype(str))
+
+    train_keys_small = keys_of(train_small, LABEL_AUTHENTIC)
+    val_keys_small = keys_of(val_small, LABEL_AUTHENTIC)
+    train_keys_large = keys_of(train_large, LABEL_AUTHENTIC)
+    val_keys_large = keys_of(val_large, LABEL_AUTHENTIC)
+
+    shared = (train_keys_small | val_keys_small) & (train_keys_large | val_keys_large)
+    assert len(shared) == 30  # every small-run authentic row reappears in the large pool
+
+    flipped = (shared & train_keys_small & val_keys_large) | (
+        shared & val_keys_small & train_keys_large
+    )
+    assert flipped == set()
+
+
+def test_split_still_roughly_matches_requested_fraction():
+    """The hash-based assignment is a per-item Bernoulli draw, not an exact
+    top-N% slice -- confirm it still lands close to the requested fraction at
+    a reasonable generator count, rather than silently drifting."""
+    frame = _frame_with_generators(n_generators=200, n_authentic=1000)
+    train, val = generator_disjoint_split(frame, holdout_fraction=0.2, seed=0)
+
+    generated_frame = frame.loc[frame["label"] == LABEL_GENERATED]
+    val_generated = val.loc[val["label"] == LABEL_GENERATED]
+    val_generators = val_generated["model_name"].nunique()
+    all_generators = generated_frame["model_name"].nunique()
+    assert 0.1 < val_generators / all_generators < 0.3
+
+
 def test_split_requires_multiple_generators():
     frame = pd.DataFrame(
         [
