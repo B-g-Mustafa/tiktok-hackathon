@@ -41,9 +41,11 @@ MAIN_REPO_ROOT = PROJECT_ROOT.parent.parent
 if str(MAIN_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(MAIN_REPO_ROOT))
 
+import pandas as pd  # noqa: E402
 import torch  # noqa: E402
 import torchvision.transforms as T  # noqa: E402
 from PIL import Image  # noqa: E402
+from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score  # noqa: E402
 
 from models import build_detector  # noqa: E402
 from training.utils import load_checkpoint  # noqa: E402
@@ -72,6 +74,14 @@ def main() -> int:
     )
     parser.add_argument("--limit", type=int, default=None,
                          help="Score at most this many images (smoke test).")
+    parser.add_argument(
+        "--manifest", type=Path, default=None,
+        help="manifest.parquet with a 'path'/'label' column (the output of "
+             "prepare_finetune_data.py) to compute AUROC/AP/accuracy against, "
+             "in addition to raw predictions. Default: auto-detect "
+             "'manifest.parquet' inside --image-dir; pass an explicit path, "
+             "or a nonexistent one, to skip metrics entirely.",
+    )
     args = parser.parse_args()
 
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -139,6 +149,49 @@ def main() -> int:
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(records, indent=2))
     print(f"scored {len(records)} image(s) -> {args.out}")
+
+    # -- metrics, only if a labeled manifest is available --------------------
+    manifest_path = args.manifest or (args.image_dir / "manifest.parquet")
+    if not manifest_path.exists():
+        return 0
+
+    manifest = pd.read_parquet(manifest_path)
+    label_by_path = {
+        str(Path(row.path).resolve()): int(row.label) for row in manifest.itertuples()
+    }
+    y_true, y_score = [], []
+    for record in records:
+        label = label_by_path.get(record["image_path"])
+        if label is not None:
+            y_true.append(label)
+            y_score.append(record["pred"])
+
+    if len(y_true) < len(records):
+        print(
+            f"WARNING: only {len(y_true)}/{len(records)} predictions matched "
+            f"a row in {manifest_path} -- metrics below are computed on the "
+            f"matched subset only",
+            file=sys.stderr,
+        )
+
+    if len(set(y_true)) < 2:
+        print("not enough labeled/matched images with both classes -- skipping metrics",
+              file=sys.stderr)
+        return 0
+
+    metrics = {
+        "n_matched": len(y_true),
+        "auroc": round(float(roc_auc_score(y_true, y_score)), 6),
+        "ap": round(float(average_precision_score(y_true, y_score)), 6),
+        "accuracy": round(
+            float(accuracy_score(y_true, [s >= 0.5 for s in y_score])), 6
+        ),
+    }
+    metrics_path = args.out.with_suffix(".metrics.json")
+    metrics_path.write_text(json.dumps(metrics, indent=2))
+    print(f"metrics ({metrics['n_matched']} images): "
+          f"AUROC={metrics['auroc']:.4f}  AP={metrics['ap']:.4f}  "
+          f"acc={metrics['accuracy']:.4f}  -> {metrics_path}")
     return 0
 
 

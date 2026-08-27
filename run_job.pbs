@@ -15,7 +15,7 @@ conda activate tiktok
 
 export HF_HOME="/home/users/ntu/suhelkha/scratch/mustafa/hf_cache"
 export TORCH_HOME="/home/users/ntu/suhelkha/scratch/mustafa/hf_cache/torch"
-# export HF_TOKEN="..."   # only needed if pulling a gated model
+# export HF_TOKEN=""  # only needed if pulling a gated model
 
 cd "$REPO_DIR"
 mkdir -p "$MODELS_DIR/features" outputs/logs
