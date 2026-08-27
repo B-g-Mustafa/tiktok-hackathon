@@ -2,7 +2,7 @@
 #PBS -N aigc-baseline-eval
 #PBS -q normal
 #PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
-#PBS -l walltime=04:00:00
+#PBS -l walltime=10:00:00
 #PBS -j oe
 #PBS -o outputs/logs/job_output.log
 
