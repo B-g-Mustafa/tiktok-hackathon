@@ -57,11 +57,20 @@ def materialize(
     selection: pd.DataFrame,
     output_dir: Path,
     skip_existing: bool = True,
+    show_progress: bool = True,
+    checkpoint_every: int = 500,
 ) -> MaterializeStats:
     """Download and decode every row in `selection` once, to local PNGs.
 
     Idempotent: if the manifest already lists a key, that image is skipped, so
-    a failed or interrupted run can simply be re-invoked.
+    a failed or interrupted run can simply be re-invoked -- interrupting a
+    multi-hour download and resuming it later is a normal thing to do here,
+    not an edge case.
+
+    `show_progress` drives a `tqdm` bar over images written and cumulative
+    bytes on disk. Fetching happens inside the `iter_selected_images`
+    generator, so the bar reflects real network+decode progress as images
+    actually arrive, not an estimate.
     """
     from src.data.parquet_images import iter_selected_images
 
@@ -71,46 +80,82 @@ def materialize(
 
     existing_keys: set[str] = set()
     rows: list[dict] = []
+    bytes_written = 0
     if skip_existing and manifest_path.exists():
         existing = pd.read_parquet(manifest_path)
         existing_keys = set(existing["key"])
         rows = existing.to_dict("records")
-        logger.info("resuming: %d images already materialized", len(existing_keys))
+        bytes_written = sum(
+            Path(r["path"]).stat().st_size
+            for r in rows
+            if Path(r["path"]).exists()
+        )
+        logger.info(
+            "resuming: %d images already materialized (%.2f GB)",
+            len(existing_keys), bytes_written / 1e9,
+        )
 
     n_written = len(rows)
     n_failed = 0
+    n_total = len(selection)
 
-    for fetched in iter_selected_images(repo_id, selection):
-        if fetched.key in existing_keys:
-            continue
+    iterator = iter_selected_images(repo_id, selection)
+    progress = None
+    if show_progress:
+        from tqdm import tqdm
 
-        safe_name = fetched.key.replace("/", "_").replace("#", "__")
-        path = output_dir / f"{safe_name}.png"
-
-        try:
-            fetched.image.save(path, format="PNG")
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("failed to write %s: %s", fetched.key, exc)
-            n_failed += 1
-            continue
-
-        rows.append(
-            {
-                "key": fetched.key,
-                "path": str(path),
-                "label": fetched.label,
-                "model_name": fetched.model_name,
-                "min_side": fetched.min_side,
-            }
+        progress = tqdm(
+            total=n_total,
+            initial=n_written,
+            desc=f"materializing {output_dir.name}",
+            unit="img",
         )
-        existing_keys.add(fetched.key)
-        n_written += 1
+        progress.set_postfix_str(f"{bytes_written / 1e9:.2f} GB")
 
-        if n_written % 500 == 0:
-            # Checkpoint the manifest periodically so a crash mid-run does not
-            # lose already-materialized work.
-            pd.DataFrame(rows).to_parquet(manifest_path, index=False)
-            logger.info("materialized %d images so far", n_written)
+    try:
+        for fetched in iterator:
+            if fetched.key in existing_keys:
+                continue
+
+            safe_name = fetched.key.replace("/", "_").replace("#", "__")
+            path = output_dir / f"{safe_name}.png"
+
+            try:
+                fetched.image.save(path, format="PNG")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("failed to write %s: %s", fetched.key, exc)
+                n_failed += 1
+                continue
+
+            rows.append(
+                {
+                    "key": fetched.key,
+                    "path": str(path),
+                    "label": fetched.label,
+                    "model_name": fetched.model_name,
+                    "min_side": fetched.min_side,
+                }
+            )
+            existing_keys.add(fetched.key)
+            n_written += 1
+            bytes_written += path.stat().st_size
+
+            if progress is not None:
+                progress.update(1)
+                progress.set_postfix_str(f"{bytes_written / 1e9:.2f} GB")
+
+            if n_written % checkpoint_every == 0:
+                # Checkpoint the manifest periodically so a crash mid-run does
+                # not lose already-materialized work.
+                pd.DataFrame(rows).to_parquet(manifest_path, index=False)
+                if progress is None:
+                    logger.info(
+                        "materialized %d/%d images (%.2f GB)",
+                        n_written, n_total, bytes_written / 1e9,
+                    )
+    finally:
+        if progress is not None:
+            progress.close()
 
     pd.DataFrame(rows).to_parquet(manifest_path, index=False)
     return MaterializeStats(n_written, n_failed, output_dir)
