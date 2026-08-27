@@ -1,0 +1,21 @@
+# Core pipeline: data auditing, splits, transforms, metrics, inference contract.
+# These alone are enough to run the shortcut audit and predict.py.
+numpy>=1.26
+pandas>=2.2
+pyarrow>=15.0
+pillow>=10.2
+scikit-learn>=1.4
+requests>=2.31
+huggingface_hub>=0.24
+pyyaml>=6.0
+tqdm>=4.66
+
+# Model stack. Installed separately on the GPU box; not needed for the audit,
+# the split builder, or the predict.py contract tests.
+torch>=2.2
+timm>=1.0.9          # provides the SigLIP2 vision tower
+peft>=0.13           # LoRA adapters for fine-tuning (scripts/finetune_lora.py)
+datasets>=2.20       # streaming image bytes for feature extraction
+
+# Development
+pytest>=8.0

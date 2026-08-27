@@ -1,0 +1,26 @@
+{
+  "dataset": "OwensLab/CommunityForensics-Small",
+  "authentic": {
+    "n": 300,
+    "resolutions": {
+      "(1024, 1024)": 300
+    },
+    "formats": {
+      "PNG": 300
+    }
+  },
+  "generated": {
+    "n": 300,
+    "resolutions": {
+      "(512, 512)": 300
+    },
+    "formats": {
+      "PNG": 300
+    }
+  },
+  "canary": {
+    "name": "resolution-only",
+    "auroc": 0.0,
+    "is_alarming": true
+  }
+}

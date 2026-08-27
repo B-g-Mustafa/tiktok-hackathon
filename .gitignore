@@ -1,0 +1,29 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Environments
+.venv/
+venv/
+.env
+
+# Artifacts: manifests, splits, cached features, checkpoints, reports.
+# These are regenerable from the scripts and can be very large.
+# Leading slash anchors to the repo root -- an unanchored "artifacts/" would
+# also match any nested directory of that name.
+/artifacts/
+
+# Downloaded datasets. The default output dir of the GenImage downloader is
+# inside the repo, and a single category is tens of GB.
+# MUST stay anchored: a bare "data/" also matches src/data/, which would
+# silently exclude the entire data module from the repository.
+/data/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
