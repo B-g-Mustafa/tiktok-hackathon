@@ -53,6 +53,48 @@ class FeatureCache:
     def clean(self) -> "FeatureCache":
         return self.view("clean")
 
+    def by_generator(self, name: str) -> "FeatureCache":
+        """Rows from one generator (or one real source).
+
+        The `generators` column has been carried through the cache since the
+        beginning but nothing ever sliced on it -- every metric was aggregated
+        over all generators at once. That hides the distinction between "this
+        model is uniformly mediocre out of domain" and "this model is strong on
+        most generators and catastrophic on two", which call for completely
+        different fixes.
+
+        Note a per-generator slice contains only generated rows, so it is
+        single-class and its AUROC is undefined. Pair it with authentic rows --
+        `generator_slices()` does this for you.
+        """
+        mask = self.generators == name
+        return self._subset(mask)
+
+    def unique_generators(self) -> list[str]:
+        """Generators present among the GENERATED rows only.
+
+        Authentic rows carry their source dataset in the same column (FFHQ,
+        ImageNet, ...), which is useful separately but is not a generator.
+        """
+        generated = self.generators[self.labels == 1]
+        return sorted(set(generated.tolist()))
+
+    def generator_slices(self) -> dict[str, "FeatureCache"]:
+        """One evaluable subset per generator: that generator's fakes plus ALL
+        authentic rows.
+
+        Sharing the authentic pool across slices is deliberate. Per-generator
+        AUROC answers "how well does this model catch THIS generator against
+        real images", and the real-image pool should be held constant so the
+        numbers are comparable across generators rather than each being scored
+        against a different, tiny slice of reals.
+        """
+        authentic_mask = self.labels == 0
+        return {
+            name: self._subset(authentic_mask | (self.generators == name))
+            for name in self.unique_generators()
+        }
+
     def _subset(self, mask: np.ndarray) -> "FeatureCache":
         return FeatureCache(
             features=self.features[mask],

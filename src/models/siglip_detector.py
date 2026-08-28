@@ -26,10 +26,42 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from src.calibration import (
+    LogitScaler,
+    logits_to_probabilities,
+    probabilities_to_logits,
+)
 from src.models.base import Detector
 from src.transforms.crop import multi_crop_views
 
-__all__ = ["load_siglip_detector", "FrozenProbeDetector", "LoraDetector"]
+__all__ = [
+    "load_siglip_detector",
+    "FrozenProbeDetector",
+    "LoraDetector",
+    "CALIBRATION_NAME",
+]
+
+# Written into the checkpoint directory by scripts/calibrate.py, loaded here if
+# present. Absent means "uncalibrated", which resolves to an identity scaler.
+CALIBRATION_NAME = "calibration.json"
+
+
+def _aggregate(view_scores: np.ndarray, scaler: LogitScaler) -> float:
+    """Combine per-crop probabilities into one image-level probability.
+
+    Averaged in LOGIT space, not probability space. Averaging probabilities
+    pulls every result toward the middle -- five crops at 0.95 and one at 0.05
+    average to 0.80, which understates a near-unanimous verdict -- and that
+    compression is precisely what wrecks calibration. Logit averaging (the
+    geometric mean of the odds) keeps confident agreement confident, and is
+    also the form the calibration correction is defined against, so the two
+    compose correctly instead of fighting each other.
+
+    Calibration is applied AFTER aggregation: the scaler is fitted on final
+    image-level scores, so it must see the same quantity at inference.
+    """
+    mean_logit = float(np.mean(probabilities_to_logits(view_scores)))
+    return float(logits_to_probabilities(scaler.transform_logits(mean_logit)))
 
 
 class FrozenProbeDetector:
@@ -37,10 +69,13 @@ class FrozenProbeDetector:
 
     name = "siglip2-frozen-probe"
 
-    def __init__(self, encoder, head, n_crops: int = 4) -> None:
+    def __init__(
+        self, encoder, head, n_crops: int = 4, scaler: LogitScaler | None = None
+    ) -> None:
         self.encoder = encoder
         self.head = head
         self.n_crops = n_crops
+        self.scaler = scaler or LogitScaler()
 
     def predict_batch(self, images: list[Image.Image]) -> list[float]:
         scores = []
@@ -53,7 +88,7 @@ class FrozenProbeDetector:
             ]
             features = self.encoder.extract(views)
             probs = self.head.predict_proba(features)
-            scores.append(float(np.mean(probs)))
+            scores.append(_aggregate(probs, self.scaler))
         return scores
 
 
@@ -62,12 +97,15 @@ class LoraDetector:
 
     name = "siglip2-lora"
 
-    def __init__(self, encoder, head, n_crops: int = 4) -> None:
+    def __init__(
+        self, encoder, head, n_crops: int = 4, scaler: LogitScaler | None = None
+    ) -> None:
         import torch
 
         self.encoder = encoder
         self.head = head
         self.n_crops = n_crops
+        self.scaler = scaler or LogitScaler()
         self._torch = torch
 
     def predict_batch(self, images: list[Image.Image]) -> list[float]:
@@ -82,9 +120,13 @@ class LoraDetector:
             features = self.encoder.extract(views)  # (V, dim) numpy, no grad
             with self._torch.no_grad():
                 tensor = self._torch.from_numpy(features).to(self.encoder.device)
-                logits = self.head(tensor)
-                probs = self._torch.sigmoid(logits).cpu().numpy()
-            scores.append(float(np.mean(probs)))
+                # The head emits logits directly, so average them as-is rather
+                # than round-tripping through sigmoid and back.
+                view_logits = self.head(tensor).cpu().numpy()
+            mean_logit = float(np.mean(view_logits))
+            scores.append(
+                float(logits_to_probabilities(self.scaler.transform_logits(mean_logit)))
+            )
         return scores
 
 
@@ -100,6 +142,9 @@ def load_siglip_detector(
             f"(expected output of train_and_evaluate.py or finetune_lora.py)"
         )
     meta = json.loads(meta_path.read_text())
+    # Identity when the checkpoint carries no calibration, so both paths below
+    # are written the same way regardless.
+    scaler = LogitScaler.load_if_present(checkpoint_dir / CALIBRATION_NAME)
 
     if (checkpoint_dir / "adapter_config.json").exists():
         import torch
@@ -123,7 +168,7 @@ def load_siglip_detector(
         )
         head.to(encoder.device).eval()
 
-        return LoraDetector(encoder, head, n_crops=n_crops)
+        return LoraDetector(encoder, head, n_crops=n_crops, scaler=scaler)
 
     from src.models.encoders import FrozenEncoder
     from src.training.head import LinearHead
@@ -133,4 +178,4 @@ def load_siglip_detector(
     )
     head = LinearHead.load(checkpoint_dir / "head.npz")
 
-    return FrozenProbeDetector(encoder, head, n_crops=n_crops)
+    return FrozenProbeDetector(encoder, head, n_crops=n_crops, scaler=scaler)

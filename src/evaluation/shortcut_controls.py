@@ -31,6 +31,8 @@ __all__ = [
     "feature_canary",
     "resolution_canary",
     "scale_canary",
+    "format_canary",
+    "categorical_canary",
     "SHORTCUT_ALARM_AUROC",
 ]
 
@@ -167,5 +169,70 @@ def scale_canary(
         description=(
             "image min(width, height); the only size cue that survives "
             "fixed-size native cropping"
+        ),
+    )
+
+
+def categorical_canary(
+    values: np.ndarray | list[str],
+    labels: np.ndarray | list[int],
+    name: str,
+    description: str,
+) -> CanaryResult:
+    """Can a categorical artifact (file format, colour mode, ...) predict the
+    label?
+
+    A categorical feature has no meaningful ordering, so `feature_canary`'s
+    min-max scaling of an arbitrary integer encoding would produce an AUROC
+    that depends on the accidental ordering of the category names. Instead
+    each category is scored by the observed generated-rate within it -- the
+    best any classifier could do seeing only that category -- which makes the
+    resulting AUROC the true ceiling of the shortcut.
+    """
+    values = np.asarray(values).ravel()
+    labels = np.asarray(labels, dtype=int).ravel()
+
+    if len(values) != len(labels):
+        raise ValueError("values and labels must be the same length")
+    if len(labels) == 0:
+        raise ValueError("cannot run a canary on an empty sample")
+
+    scores = np.zeros(len(labels), dtype=np.float64)
+    for category in np.unique(values):
+        mask = values == category
+        scores[mask] = labels[mask].mean()
+
+    return CanaryResult(
+        name=name,
+        feature_description=description,
+        metrics=compute_metrics(labels, scores),
+    )
+
+
+def format_canary(
+    formats: np.ndarray | list[str], labels: np.ndarray | list[int]
+) -> CanaryResult:
+    """Can the FILE FORMAT alone predict the label?
+
+    This is the gate for any dataset mixing sources with different storage
+    conventions, and it is the specific reason GenImage cannot be trained on
+    naively: its authentic class is ImageNet (JPEG, modal quality ~96) while
+    its generated class is written as lossless PNG. A detector handed that
+    split can reach high accuracy by learning "JPEG artifacts present => real",
+    which transfers to nothing. Published bias-controlled re-runs of GenImage
+    moved cross-generator performance by more than 11 points once format and
+    size were equalized.
+
+    Community Forensics does NOT have this problem (both classes are ~100%
+    PNG), which is why it never came up in phase 1 -- the canary only becomes
+    necessary once a second dataset enters the pool.
+    """
+    return categorical_canary(
+        formats,
+        labels,
+        name="format-only",
+        description=(
+            "file container format (JPEG/PNG/...); no image content. "
+            "Alarms when the two classes were stored differently."
         ),
     )

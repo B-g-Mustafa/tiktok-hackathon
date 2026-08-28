@@ -27,6 +27,8 @@ __all__ = [
     "BinaryMetrics",
     "compute_metrics",
     "expected_calibration_error",
+    "equal_error_rate",
+    "best_balanced_accuracy",
     "RobustnessMatrix",
 ]
 
@@ -75,6 +77,52 @@ def _tpr_at_fpr(y_true: np.ndarray, y_score: np.ndarray, target_fpr: float) -> f
     return float(tpr[allowed].max())
 
 
+def equal_error_rate(y_true: np.ndarray, y_score: np.ndarray) -> float:
+    """The rate where FPR and FNR cross.
+
+    Threshold-free like AUROC, but expressed as an error rate, which makes the
+    gap against `accuracy` legible: a model with EER 0.24 that scores 0.45
+    accuracy at threshold 0.5 is not a weak model, it is a *misthresholded*
+    one. That distinction is the whole point of tracking both.
+    """
+    fpr, tpr, _ = roc_curve(y_true, y_score)
+    fnr = 1.0 - tpr
+    crossing = int(np.nanargmin(np.abs(fpr - fnr)))
+    return float((fpr[crossing] + fnr[crossing]) / 2.0)
+
+
+def best_balanced_accuracy(
+    y_true: np.ndarray, y_score: np.ndarray
+) -> tuple[float, float]:
+    """Best achievable balanced accuracy and the threshold that achieves it.
+
+    Reported alongside accuracy@0.5 specifically to separate "the scores cannot
+    separate these classes" from "the scores separate them fine but 0.5 is the
+    wrong cut". Under distribution shift the second is common and is fixable
+    without retraining -- see `src.calibration`.
+
+    Note this threshold is fitted ON the data being scored, so it is an
+    optimistic upper bound, not an honest operating point. Use it as a
+    diagnostic ceiling; fit a real threshold on held-out data for deployment.
+    """
+    fpr, tpr, thresholds = roc_curve(y_true, y_score)
+    balanced = (tpr + (1.0 - fpr)) / 2.0
+    best = int(np.argmax(balanced))
+
+    # sklearn prepends an `inf` threshold representing "predict nothing
+    # positive". For a degenerate scorer (every score identical) that point can
+    # win the argmax, and `inf` then serializes as the literal `Infinity`,
+    # which is NOT valid strict JSON and breaks conforming readers of the
+    # metrics file. Fall back to the highest real score, which is the same
+    # decision boundary in practice.
+    threshold = float(thresholds[best])
+    if not np.isfinite(threshold):
+        finite = thresholds[np.isfinite(thresholds)]
+        threshold = float(finite.max()) if finite.size else float(np.max(y_score))
+
+    return float(balanced[best]), threshold
+
+
 @dataclass(frozen=True)
 class BinaryMetrics:
     """Metrics for one (model, transform) cell of the robustness matrix."""
@@ -87,12 +135,32 @@ class BinaryMetrics:
     tpr_at_fpr: Mapping[float, float]
     n_positive: int
     n_negative: int
+    # Threshold-independent / threshold-tuned companions to `accuracy`, which
+    # is fixed at 0.5. Defaulted so older callers constructing BinaryMetrics
+    # directly keep working.
+    balanced_accuracy: float = float("nan")
+    eer: float = float("nan")
+    best_balanced_accuracy: float = float("nan")
+    best_threshold: float = float("nan")
+
+    @property
+    def threshold_gap(self) -> float:
+        """How much accuracy is being lost purely to a misplaced threshold.
+
+        Large gap + high AUROC is the signature of a calibration failure under
+        distribution shift, not of a weak representation.
+        """
+        return self.best_balanced_accuracy - self.balanced_accuracy
 
     def as_row(self) -> dict[str, float]:
         row = {
             "auroc": self.auroc,
             "ap": self.average_precision,
             "accuracy": self.accuracy,
+            "balanced_accuracy": self.balanced_accuracy,
+            "best_balanced_accuracy": self.best_balanced_accuracy,
+            "best_threshold": self.best_threshold,
+            "eer": self.eer,
             "ece": self.ece,
             "brier": self.brier,
         }
@@ -145,6 +213,16 @@ def compute_metrics(
         for target in FPR_TARGETS
     }
 
+    if single_class:
+        balanced = eer = best_balanced = best_threshold = float("nan")
+    else:
+        predicted = (y_score >= threshold).astype(int)
+        tpr = float((predicted[y_true == 1] == 1).mean())
+        tnr = float((predicted[y_true == 0] == 0).mean())
+        balanced = (tpr + tnr) / 2.0
+        eer = equal_error_rate(y_true, y_score)
+        best_balanced, best_threshold = best_balanced_accuracy(y_true, y_score)
+
     return BinaryMetrics(
         auroc=auroc,
         average_precision=ap,
@@ -154,6 +232,10 @@ def compute_metrics(
         tpr_at_fpr=tpr_at_fpr,
         n_positive=n_positive,
         n_negative=n_negative,
+        balanced_accuracy=balanced,
+        eer=eer,
+        best_balanced_accuracy=best_balanced,
+        best_threshold=best_threshold,
     )
 
 

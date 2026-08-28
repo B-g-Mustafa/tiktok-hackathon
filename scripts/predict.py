@@ -12,7 +12,12 @@ produces a JSON array:
       {"image_path": "/abs/path/img2.png", "pred": 0.0832}
     ]
 
-where `pred` is the calibrated probability that the image is AI-generated.
+where `pred` is the probability that the image is AI-generated.
+
+That score is calibrated only if the checkpoint carries a `calibration.json`
+(written by `scripts/calibrate.py`); otherwise it is the model's raw output,
+which under dataset shift is systematically biased and should not be read as a
+true probability. `--model siglip2` logs which case applies at startup.
 
 Design notes
 ------------
@@ -34,10 +39,12 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score  # noqa: E402
 
 from src.data.io import iter_image_paths, load_image  # noqa: E402
+from src.evaluation.metrics import compute_metrics  # noqa: E402
 from src.logging_utils import configure_logging  # noqa: E402
 from src.models.base import ConstantDetector, Detector  # noqa: E402
 from src.transforms.robustness import eval_grid  # noqa: E402
@@ -177,6 +184,7 @@ def write_metrics_report(records: list[dict], image_dir: Path, out_path: Path,
         )
         return
 
+    detailed = compute_metrics(np.asarray(y_true), np.asarray(y_score))
     metrics = {
         "n_matched": len(y_true),
         "auroc": round(float(roc_auc_score(y_true, y_score)), 6),
@@ -184,14 +192,37 @@ def write_metrics_report(records: list[dict], image_dir: Path, out_path: Path,
         "accuracy": round(
             float(accuracy_score(y_true, [s >= 0.5 for s in y_score])), 6
         ),
+        "balanced_accuracy": round(detailed.balanced_accuracy, 6),
+        "best_balanced_accuracy": round(detailed.best_balanced_accuracy, 6),
+        "best_threshold": round(detailed.best_threshold, 6),
+        "eer": round(detailed.eer, 6),
+        "ece": round(detailed.ece, 6),
     }
     metrics_path = out_path.with_suffix(".metrics.json")
     metrics_path.write_text(json.dumps(metrics, indent=2))
     logger.info(
-        "metrics (%d images): AUROC=%.4f  AP=%.4f  acc=%.4f  -> %s",
+        "metrics (%d images): AUROC=%.4f  AP=%.4f  acc=%.4f  bal_acc=%.4f  "
+        "EER=%.4f  ECE=%.4f  -> %s",
         metrics["n_matched"], metrics["auroc"], metrics["ap"],
-        metrics["accuracy"], metrics_path,
+        metrics["accuracy"], metrics["balanced_accuracy"],
+        metrics["eer"], metrics["ece"], metrics_path,
     )
+
+    # The single most actionable diagnostic: a large gap here means the scores
+    # rank fine and the THRESHOLD is wrong, which scripts/calibrate.py fixes
+    # without retraining. Without this line the low accuracy reads as a weak
+    # model and invites an expensive, unnecessary retrain.
+    if detailed.threshold_gap > 0.05:
+        logger.warning(
+            "balanced accuracy would be %.4f at threshold %.4f instead of "
+            "%.4f at 0.5 (+%.4f) -- this looks like a calibration failure, "
+            "not a weak model. Fit a correction with:\n"
+            "  python scripts/calibrate.py --predictions %s --manifest %s "
+            "--checkpoint <ckpt>",
+            detailed.best_balanced_accuracy, detailed.best_threshold,
+            detailed.balanced_accuracy, detailed.threshold_gap,
+            out_path, manifest_path,
+        )
 
 
 def main() -> int:
@@ -248,6 +279,15 @@ def main() -> int:
 
     detector = build_detector(args.model, args.checkpoint)
     logger.info("detector: %s  degrade: %s", detector.name, args.degrade)
+
+    scaler = getattr(detector, "scaler", None)
+    if scaler is not None:
+        logger.info(
+            "scores are %s",
+            "UNCALIBRATED raw model output"
+            if scaler.is_identity
+            else f"calibrated ({scaler})",
+        )
 
     records, n_failed = run(
         image_dir=args.image_dir,
