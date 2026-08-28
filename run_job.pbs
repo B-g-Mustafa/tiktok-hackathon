@@ -22,13 +22,13 @@ cd "$REPO_DIR"
 
 echo "Job started on $(date)"
 
-# -- baseline architecture test: fit a linear head on cached train features,
-# -- evaluate the full robustness matrix on the val set --
-#python scripts/cache_features.py \
-#  --local-manifest "$IMAGES_DIR/train" \
-#  --mode train --n-views 4 \
-#  --output-dir "$MODELS_DIR/features" \
-#  --log-file outputs/logs/cache_features_train.log
+ -- baseline architecture test: fit a linear head on cached train features,
+ -- evaluate the full robustness matrix on the val set --
+python scripts/cache_features.py \
+  --local-manifest "$IMAGES_DIR/train" \
+  --mode train --n-views 4 \
+  --output-dir "$MODELS_DIR/features" \
+  --log-file outputs/logs/cache_features_train.log
 
 python scripts/cache_features.py \
   --local-manifest "$IMAGES_DIR/val" \
