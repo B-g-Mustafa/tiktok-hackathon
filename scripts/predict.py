@@ -34,6 +34,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import pandas as pd  # noqa: E402
+from sklearn.metrics import accuracy_score, average_precision_score, roc_auc_score  # noqa: E402
+
 from src.data.io import iter_image_paths, load_image  # noqa: E402
 from src.logging_utils import configure_logging  # noqa: E402
 from src.models.base import ConstantDetector, Detector  # noqa: E402
@@ -136,6 +139,61 @@ def run(
     return records, n_failed
 
 
+def write_metrics_report(records: list[dict], image_dir: Path, out_path: Path,
+                          manifest_path: Path | None) -> None:
+    """AUROC/AP/accuracy against a labeled manifest.parquet, if one is
+    available -- same contract as dyno/files/infer.py's metrics step, so the
+    two models' reports are directly comparable. Silently does nothing if no
+    manifest can be found (predict.py's core contract is label-free scoring;
+    this is a bonus when ground truth happens to be sitting right there,
+    e.g. from prepare_finetune_data.py's or
+    scripts/build_manifest_from_folders.py's output)."""
+    manifest_path = manifest_path or (image_dir / "manifest.parquet")
+    if not manifest_path.exists():
+        return
+
+    manifest = pd.read_parquet(manifest_path)
+    label_by_path = {
+        str(Path(row.path).resolve()): int(row.label) for row in manifest.itertuples()
+    }
+
+    y_true, y_score = [], []
+    for record in records:
+        label = label_by_path.get(record["image_path"])
+        if label is not None and record.get("pred") is not None:
+            y_true.append(label)
+            y_score.append(record["pred"])
+
+    if len(y_true) < len(records):
+        logger.warning(
+            "only %d/%d predictions matched a row in %s -- metrics below are "
+            "computed on the matched subset only",
+            len(y_true), len(records), manifest_path,
+        )
+
+    if len(set(y_true)) < 2:
+        logger.warning(
+            "not enough labeled/matched images with both classes -- skipping metrics"
+        )
+        return
+
+    metrics = {
+        "n_matched": len(y_true),
+        "auroc": round(float(roc_auc_score(y_true, y_score)), 6),
+        "ap": round(float(average_precision_score(y_true, y_score)), 6),
+        "accuracy": round(
+            float(accuracy_score(y_true, [s >= 0.5 for s in y_score])), 6
+        ),
+    }
+    metrics_path = out_path.with_suffix(".metrics.json")
+    metrics_path.write_text(json.dumps(metrics, indent=2))
+    logger.info(
+        "metrics (%d images): AUROC=%.4f  AP=%.4f  acc=%.4f  -> %s",
+        metrics["n_matched"], metrics["auroc"], metrics["ap"],
+        metrics["accuracy"], metrics_path,
+    )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -168,6 +226,13 @@ def main() -> int:
              "degraded input instead of only the offline robustness matrix. "
              "Default: 'clean' (no-op).",
     )
+    parser.add_argument(
+        "--manifest", type=Path, default=None,
+        help="manifest.parquet with a 'path'/'label' column to compute "
+             "AUROC/AP/accuracy against, in addition to raw predictions. "
+             "Default: auto-detect 'manifest.parquet' inside --image-dir; "
+             "pass a nonexistent path to skip metrics entirely.",
+    )
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
@@ -198,6 +263,8 @@ def main() -> int:
 
     scored = sum(1 for r in records if r.get("pred") is not None)
     logger.info("scored %d image(s); %d unreadable -> %s", scored, n_failed, args.out)
+
+    write_metrics_report(records, args.image_dir, args.out, args.manifest)
     return 0
 
 
