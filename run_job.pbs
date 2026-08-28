@@ -4,11 +4,18 @@
 #PBS -l select=1:ncpus=8:ngpus=1:mem=64gb
 #PBS -l walltime=10:00:00
 #PBS -j oe
-#PBS -o outputs/logs/job_output$(date).log
+#PBS -o outputs/logs/job_output.log
 
 REPO_DIR="/home/users/ntu/suhelkha/mustafa/tiktok/tiktok-hackathon"
 MODELS_DIR="/home/users/ntu/suhelkha/scratch/mustafa/tiktok-hackathon-models"
 IMAGES_DIR="/home/users/ntu/suhelkha/scratch/mustafa/tiktok-hackathon-data/cf-small/extracted"
+
+# Stop immediately on any failed command, instead of silently continuing to
+# the next step with stale/wrong inputs -- a crashed cache_features.py run
+# earlier let train_and_evaluate.py silently pick up a leftover, mismatched
+# val cache via `ls -t` and fail later with a confusing "config hash
+# mismatch" error instead of the real one.
+set -euo pipefail
 
 module load miniforge3/25.3.1
 conda activate tiktok
@@ -18,23 +25,29 @@ export TORCH_HOME="/home/users/ntu/suhelkha/scratch/mustafa/hf_cache/torch"
 # export HF_TOKEN=""  # only needed if pulling a gated model
 
 cd "$REPO_DIR"
-#mkdir -p "$MODELS_DIR/features" outputs/logs
+mkdir -p "$MODELS_DIR/features" outputs/logs
 
 echo "Job started on $(date)"
 
- -- baseline architecture test: fit a linear head on cached train features,
- -- evaluate the full robustness matrix on the val set --
+# Computed once into a variable, in a filename-safe format (no spaces/colons
+# -- unlike plain `date`'s default output, which broke --log-file last time
+# via word-splitting). Same timestamp for both log files below, so they're
+# easy to pair up as belonging to the same job run.
+RUN_TS=$(date +%Y%m%d_%H%M%S)
+
+# -- baseline architecture test: fit a linear head on cached train features,
+# -- evaluate the full robustness matrix on the val set --
 python scripts/cache_features.py \
   --local-manifest "$IMAGES_DIR/train" \
   --mode train --n-views 4 \
   --output-dir "$MODELS_DIR/features" \
-  --log-file outputs/logs/cache_features_train.log
+  --log-file "outputs/logs/cache_features_train_${RUN_TS}.log"
 
 python scripts/cache_features.py \
   --local-manifest "$IMAGES_DIR/val" \
   --mode eval \
   --output-dir "$MODELS_DIR/features" \
-  --log-file outputs/logs/cache_features_val$(date).log
+  --log-file "outputs/logs/cache_features_val_${RUN_TS}.log"
 
 TRAIN_CACHE=$(ls -t "$MODELS_DIR"/features/train__*__v4.npz | head -n1)
 EVAL_CACHE=$(ls -t "$MODELS_DIR"/features/val__*__eval.npz | head -n1)
